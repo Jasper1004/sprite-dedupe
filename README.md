@@ -13,7 +13,7 @@
 目前不提供 EXE 版本  
 請透過 Python 執行原始碼方式使用：
 
-### ✅ 1️⃣ 下載原始碼
+### 1️⃣ 下載原始碼
 **方式 A：透過 Git Clone**
 ```bash
 git clone https://github.com/Jasper1004/sprite-dedupe.git
@@ -25,7 +25,7 @@ cd sprite-dedupe
 
 ---
 
-### ✅ 2️⃣ 建立虛擬環境
+### 2️⃣ 建立虛擬環境
 ```bash
 python -m venv .venv
 # Windows
@@ -36,14 +36,14 @@ source .venv/bin/activate
 
 ---
 
-### ✅ 3️⃣ 安裝依賴套件
+### 3️⃣ 安裝依賴套件
 ```bash
 pip install -r requirements.txt
 ```
 
 ---
 
-### ✅ 4️⃣ 執行圖形介面
+### 4️⃣ 執行圖形介面
 ```bash
 python main.py
 ```
@@ -115,10 +115,11 @@ sprite-dedupe/
 → 自動偵測與分群
 
 3️⃣ 左側顯示分群結果，右側顯示：  
-✅ 母圖  
-✅ bbox 標記位置  
+   ✅ 母圖  
+   ✅ bbox 標記位置  
 
 4️⃣ 可切換深色 / 淺色主題  
+
 5️⃣ 可調整去白參數改善背景
 
 ---
@@ -127,5 +128,3 @@ sprite-dedupe/
 
 MIT License  
 歡迎自由開發、修改與引用本專案。
-
----
