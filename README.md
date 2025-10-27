@@ -1,4 +1,3 @@
-```markdown
 # Sprite Dedupe (Alpha-CC + pHash)
 
 精準的圖片重複檢測與 spritesheet 子圖分群工具  
