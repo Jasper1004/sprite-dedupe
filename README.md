@@ -68,6 +68,7 @@ sprite-dedupe/
 ├─ requirements.txt
 └─ README.md
 
+```
 
 ---
 
