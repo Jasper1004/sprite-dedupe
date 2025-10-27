@@ -8,11 +8,45 @@
 
 ---
 
-## 📦 下載 (Windows)
+## 📦 下載與安裝
 
-➡ https://github.com/Jasper1004/sprite-dedupe/releases  
-下載 `SpriteDedupe_win64.zip` → 解壓縮 → 執行 `SpriteDedupe.exe`
-**不需要安裝！**
+目前不提供 EXE 版本  
+請透過 Python 執行原始碼方式使用：
+
+### ✅ 1️⃣ 下載原始碼
+**方式 A：透過 Git Clone**
+```bash
+git clone https://github.com/Jasper1004/sprite-dedupe.git
+cd sprite-dedupe
+```
+
+**方式 B：手動下載**
+> Code → Download ZIP → 解壓縮後進入資料夾
+
+---
+
+### ✅ 2️⃣ 建立虛擬環境
+```bash
+python -m venv .venv
+# Windows
+.venv\Scripts\activate
+# macOS/Linux
+source .venv/bin/activate
+```
+
+---
+
+### ✅ 3️⃣ 安裝依賴套件
+```bash
+pip install -r requirements.txt
+```
+
+---
+
+### ✅ 4️⃣ 執行圖形介面
+```bash
+python main.py
+```
 
 ---
 
@@ -22,10 +56,13 @@
 |------|------|
 | Spritesheet 自動分割 | 透過 Alpha CC 偵測子圖 bbox |
 | 多通道 pHash 分群 | primary/secondary/U/V/alpha/edge channels |
-| 深色/淺色主題切換 | UI 可手動切換 |
-| 同群預覽 | 顯示母圖 + bbox 的位置 |
-| 高相似度篩選 | 雙階段特徵比對避免誤群組 |
-| 結果可匯出 | JSON 格式，可作為後續 pipeline 資料 |
+| 深色/淺色主題切換 | UI 可切換 |
+| 母圖標記對應位置 | 群組內顯示 bbox |
+| 避免誤群組 | 雙階段特徵比對 |
+| 結果可匯出 | JSON 格式 |
+
+> 📌 至少兩張相似圖片才會生成一個群組  
+> 📌 獨立圖片不顯示，避免干擾判讀
 
 ---
 
@@ -35,9 +72,7 @@
 |------|------|
 | 作業系統 | Windows 10/11 (x64) |
 | RAM | 建議 ≥ 8GB |
-| Python 執行（只對開發者） | Python 3.10+ |
-
-> 使用者直接執行 EXE 無需 Python。
+| Python | 3.10+ |
 
 ---
 
@@ -49,51 +84,48 @@ sprite-dedupe/
 │  ├─ __init__.py
 │  ├─ constants.py
 │  ├─ core/
-│  │  ├─ alpha_cc.py      # Alpha Connected Components（子圖框選）
-│  │  ├─ phash.py         # 多通道 pHash（含旋轉/翻轉搜尋）
-│  │  └─ features.py      # 直方圖/卡方距離等特徵工具
+│  │  ├─ alpha_cc.py      # Alpha Connected Components：子圖框選
+│  │  ├─ phash.py         # 多通道 pHash，比對旋轉/翻轉等變化
+│  │  └─ features.py      # 直方圖、卡方距離等特徵工具
 │  ├─ utils/
-│  │  ├─ atomic.py        # 原子化寫入，避免中斷壞檔
-│  │  └─ image_io.py      # QPixmap/QImage、white-key 去白、結果輸出
+│  │  ├─ atomic.py        # 原子化檔案寫入
+│  │  └─ image_io.py      # 去白、影像輸出與處理
 │  ├─ stores/
-│  │  ├─ feature_store.py # 特徵快取（原子寫/載）
-│  │  ├─ index_store.py   # 檔案索引/變更追蹤
-│  │  └─ logger.py        # 操作/事件紀錄
+│  │  ├─ feature_store.py # 特徵快取
+│  │  ├─ index_store.py   # 檔案索引管理
+│  │  └─ logger.py        # 事件記錄
 │  └─ ui/
 │     ├─ widgets.py       # BBoxGraphicsView、ImageLabel
-│     ├─ group_widget.py  # GroupResultsWidget（群組清單 + 縮圖）
+│     ├─ group_widget.py  # GroupResultsWidget：分群顯示
 │     ├─ dialogs.py       # PairDecisionDialog
-│     └─ main_window.py   # MainWindow（主題切換、流程控制）
-├─ main.py                # 入口
+│     └─ main_window.py   # 主視窗與 UI 控制流程
+├─ main.py                # 程式入口
 ├─ requirements.txt
 └─ README.md
-
 ```
 
 ---
 
 ## 📘 使用教學
 
-1. 點選 **新增圖片**，**新增資料夾**，加入 spritesheet 或 散圖
-2. 點擊 **開始處理** → 自動偵測與分群
-3. 左側為群組結果
-4. 點選子圖 → 右側顯示母圖 + 位置標記
-5. 可切換深色/淺色主題
-6. 可調整去白參數（若啟用）
+1️⃣ 加入 spritesheet 或散圖：  
+→ 點 **新增圖片** 或 **新增資料夾**
 
-> 至少兩張相似圖片才會生成一個群組 ✅  
-> 獨立圖片不會顯示（避免干擾分析）
+2️⃣ 點 **開始處理**：  
+→ 自動偵測與分群
+
+3️⃣ 左側顯示分群結果，右側顯示：  
+✅ 母圖  
+✅ bbox 標記位置  
+
+4️⃣ 可切換深色 / 淺色主題  
+5️⃣ 可調整去白參數改善背景
 
 ---
 
-## 🔧 安裝（開發者）
+## 📝 License
 
-```bash
-python -m venv .venv
-# Windows
-.venv\Scripts\activate
-# macOS/Linux
-source .venv/bin/activate
+MIT License  
+歡迎自由開發、修改與引用本專案。
 
-pip install -r requirements.txt
-python main.py
+---
