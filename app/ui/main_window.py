@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from collections import defaultdict
 
 from ..constants import (
-    LIGHT_QSS, DARK_QSS,
+    LIGHT_QSS, DARK_QSS, VERSION,
     ROT_DEG_STEP_DEFAULT, INCLUDE_FLIP_TEST_DEFAULT,
     PHASH_HAMMING_MAX_DEFAULT, PHASH_HAMMING_MAX_INTRA_DEFAULT,
     ALPHA_THR_DEFAULT, MIN_AREA_DEFAULT, MIN_SIZE_DEFAULT,
@@ -96,6 +96,56 @@ class PairHit:
     right_id: str
     hamming: int
 
+# 放在檔案前半、MainWindow 定義之前
+from PyQt5 import QtCore
+
+class ScanWorker(QtCore.QObject):
+    progressInit = QtCore.pyqtSignal(int)   # 總步數
+    progressStep = QtCore.pyqtSignal(int)   # 當前已完成步數
+    finished     = QtCore.pyqtSignal()
+
+    def __init__(self, task_args):
+        super().__init__()
+        self.task_args = task_args
+        self._abort = False
+
+    @QtCore.pyqtSlot()
+    def run(self):
+        """
+        這裡把你原本做『掃描/特徵抽取/比對/分群/寫檔』的流程搬進來，
+        每完成一個「可計步」的項目就 emit progressStep。
+        """
+        # 1) 先計算總步數（例如：要處理的影像數 + 後續比對數）
+        images = self.task_args.get("images", [])
+        pairs  = self.task_args.get("pairs", [])
+        total  = len(images) + len(pairs)
+        if total <= 0:
+            total = len(images)
+
+        self.progressInit.emit(total if total > 0 else 0)
+
+        done = 0
+
+        # 2) 影像特徵抽取
+        for img in images:
+            if self._abort: break
+            # ... 原本對單張影像做的工作 ...
+            done += 1
+            self.progressStep.emit(done)
+
+        # 3) 兩兩比較/分群（如果有）
+        for p in pairs:
+            if self._abort: break
+            # ... 原本 pair 計算/旋轉搜尋/哈希比對 ...
+            done += 1
+            self.progressStep.emit(done)
+
+        # 4) 結束
+        self.finished.emit()
+
+    def abort(self):
+        self._abort = True
+
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
@@ -103,7 +153,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.index = None
         self.features = None
         self.logger = None
-        self.setWindowTitle("Sprite Dedupe Pro — Alpha-CC + pHash")
+        self.setWindowTitle(f"Sprite Dedupe {VERSION}")
         self.resize(1260, 780)
 
         self.rot_step = ROT_DEG_STEP_DEFAULT
@@ -144,8 +194,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.list_files.itemSelectionChanged.connect(self._on_file_selected)
 
+        # 進度條初始化
         self.progress.setRange(0, 0)
         self.progress.setValue(0)
+
 
     def _update_info_panel(self, uuid_: str | None, sub_id: int | None, group_id: str | None):
         """將目前選擇的成員或群組寫到右側 infoPanel。"""
@@ -1485,6 +1537,46 @@ class MainWindow(QtWidgets.QMainWindow):
                 if ext in exts:
                     yield os.path.join(dirpath, fn)
 
+    def _index_is_clean_by_uuid(self, uuid_: str) -> bool:
+        try:
+            if not getattr(self, "index", None):
+                return False
+            imap = (self.index.data or {}).get("image_map", {})
+            for _, meta in imap.items():
+                if meta.get("uuid") == uuid_:
+                    return not meta.get("dirty_features", True)
+        except Exception:
+            pass
+        return False
+
+    def _load_cached_features_for_item(self, it) -> dict | None:
+        """
+        單張：直接讀 {uuid}.json 的 features
+        子圖：讀母圖 {parent_uuid}.json -> sub_images[].features
+        """
+        try:
+            if not getattr(self, "features", None):
+                return None
+            if getattr(it, "parent_uuid", None) is None:
+                feat = self.features.load(it.id)
+                return (feat or {}).get("features")
+            else:
+                mother = self.features.load(it.parent_uuid)
+                if not mother:
+                    return None
+                for si in (mother.get("sub_images") or []):
+                    sid = si.get("sub_id")
+                    if isinstance(sid, str) and sid.startswith("sub_"):
+                        try:
+                            sid = int(sid.split("_")[1])
+                        except Exception:
+                            pass
+                    if sid == it.sub_id:
+                        return (si.get("features") or {})
+        except Exception:
+            return None
+        return None
+
     def on_add_dir(self):
         root = QtWidgets.QFileDialog.getExistingDirectory(self, "選擇資料夾")
         if not root: return
@@ -1711,6 +1803,41 @@ class MainWindow(QtWidgets.QMainWindow):
         hgram_map: Dict[str, np.ndarray] = {}
 
         for it in self.pool:
+            used_cache = False
+            if getattr(self, "features", None):
+                if getattr(it, "parent_uuid", None) is None:
+                    if (not getattr(self, "index", None)) or self._index_is_clean_by_uuid(it.id):
+                        cf = self._load_cached_features_for_item(it)
+                        if cf and "phash_primary" in cf:
+                            phash_primary[it.id]   = int(cf.get("phash_primary", 0))
+                            phash_secondary[it.id] = int(cf.get("phash_secondary", 0))
+                            phash_u[it.id]         = int(cf.get("phash_u", 0))
+                            phash_v[it.id]         = int(cf.get("phash_v", 0))
+                            phash_alpha[it.id]     = int(cf.get("phash_alpha", 0))
+                            phash_edge[it.id]      = int(cf.get("phash_edge", 0))
+                            area_map[it.id]        = float(cf.get("content_area_ratio", 0.0))
+                            hgram_map[it.id]       = np.array(cf.get("gray_hist32", [0]*32), dtype=np.float32)
+                            used_cache = True
+                else:
+                    if (not getattr(self, "index", None)) or self._index_is_clean_by_uuid(it.parent_uuid):
+                        cf = self._load_cached_features_for_item(it)
+                        if cf and "phash_primary" in cf:
+                            phash_primary[it.id]   = int(cf.get("phash_primary", 0))
+                            phash_secondary[it.id] = int(cf.get("phash_secondary", 0))
+                            phash_u[it.id]         = int(cf.get("phash_u", 0))
+                            phash_v[it.id]         = int(cf.get("phash_v", 0))
+                            phash_alpha[it.id]     = int(cf.get("phash_alpha", 0))
+                            phash_edge[it.id]      = int(cf.get("phash_edge", 0))
+                            area_map[it.id]        = float(cf.get("content_area_ratio", 0.0))
+                            hgram_map[it.id]       = np.array(cf.get("gray_hist32", [0]*32), dtype=np.float32)
+                            used_cache = True
+
+            if used_cache:
+                done += 1
+                if self.progress.maximum() > 0:
+                    self.progress.setValue(done)
+                continue
+
             phash_primary[it.id]   = phash_from_canon_rgba(it.rgba, self.alpha_thr, pad_ratio=CANON_PAD_PRIMARY)
             phash_secondary[it.id] = phash_from_canon_rgba(it.rgba, self.alpha_thr, pad_ratio=CANON_PAD_SECONDARY)
             u, v = phash_from_canon_uv(it.rgba, self.alpha_thr, pad_ratio=CANON_PAD_PRIMARY)
@@ -1851,6 +1978,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_file_list_grouped_mode()
         if self.progress.maximum() > 0:
             self.progress.setValue(self.progress.maximum())
+
 
     def on_export(self):
         if not self.pool:

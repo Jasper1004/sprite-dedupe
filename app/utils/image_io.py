@@ -3,7 +3,8 @@ import os, json
 import cv2
 from PIL import Image, ImageFile
 from PyQt5 import QtGui
-from ..constants import SINGLES_BUCKET_SHIFT
+from datetime import datetime
+from ..constants import SINGLES_BUCKET_SHIFT, VERSION
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
@@ -188,5 +189,9 @@ def write_results(project_root, pairs, id2item, out_path=None):
     if out_path:
         os.makedirs(os.path.dirname(out_path), exist_ok=True)
         with open(out_path, "w", encoding="utf-8") as f:
-            json.dump({"pairs": filtered}, f, ensure_ascii=False, indent=2)
-    return len(filtered)
+            json.dump({
+                "version": VERSION,             
+                "generated_at": datetime.now().isoformat(timespec="seconds"),  
+                "pairs": filtered                    
+            }, f, ensure_ascii=False, indent=2)
+        return len(filtered)
