@@ -867,7 +867,6 @@ class GroupResultsWidget(QtWidgets.QWidget):
         self.info_size   = QtWidgets.QLabel("-")
         self.info_source = QtWidgets.QLabel("-")
         self.info_path   = QtWidgets.QLabel("-")
-        self.info_angle  = QtWidgets.QLabel("-")
         self.info_count  = QtWidgets.QLabel("-")
         
         form.addRow("UUID：",       self.info_uuid)
@@ -875,7 +874,6 @@ class GroupResultsWidget(QtWidgets.QWidget):
         form.addRow("尺寸：",       self.info_size)
         form.addRow("來源：",       self.info_source)
         form.addRow("路徑：",       self.info_path)
-        form.addRow("pHash角度：",  self.info_angle)
         form.addRow("同群數量：",    self.info_count)
         
         outer.addLayout(form)
@@ -998,7 +996,7 @@ class GroupResultsWidget(QtWidgets.QWidget):
         """將目前選擇的成員或群組寫到右側 infoPanel。"""
         if not self._info_labels:
             return
-        lab_uuid, lab_child, lab_size, lab_origin, lab_path, lab_phash, lab_dups = self._info_labels
+        lab_uuid, lab_child, lab_size, lab_origin, lab_path, lab_dups = self._info_labels
         def set_(w, v): w.setText(str(v) if w else "-")
 
         if uuid_ is None and group_id:
@@ -1009,12 +1007,11 @@ class GroupResultsWidget(QtWidgets.QWidget):
             set_(lab_size,  "-")
             set_(lab_origin, "群組")
             set_(lab_path,   group_id)
-            set_(lab_phash,  "-")
             set_(lab_dups,   len(mems) if mems else "-")
             return
 
         if not uuid_:
-            for w in (lab_uuid, lab_child, lab_size, lab_origin, lab_path, lab_phash, lab_dups):
+            for w in (lab_uuid, lab_child, lab_size, lab_origin, lab_path, lab_dups):
                 set_(w, "-")
             return
 
@@ -1058,8 +1055,6 @@ class GroupResultsWidget(QtWidgets.QWidget):
             set_(lab_dups, len(grp.get("members", [])) if grp else "-")
         else:
             set_(lab_dups, "-")
-
-        set_(lab_phash, "-")
 
 
 

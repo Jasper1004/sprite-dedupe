@@ -144,6 +144,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.list_files.itemSelectionChanged.connect(self._on_file_selected)
 
+        self.progress.setRange(0, 0)
+        self.progress.setValue(0)
 
     def _update_info_panel(self, uuid_: str | None, sub_id: int | None, group_id: str | None):
         """將目前選擇的成員或群組寫到右側 infoPanel。"""
@@ -1191,7 +1193,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.group_view.info_size,
                 self.group_view.info_source,
                 self.group_view.info_path,
-                self.group_view.info_angle,
                 self.group_view.info_count,
             ),
         )
@@ -1615,7 +1616,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self._input_order:
             QtWidgets.QMessageBox.information(self, "提示", "請先新增圖片。")
             return
-            
+        
+        self.progress.setRange(0, 0)
+        self.progress.setValue(0)
+                    
         self.items_raw.clear()
         self.id2item.clear()
         total = len(self._input_order)
@@ -1681,6 +1685,22 @@ class MainWindow(QtWidgets.QMainWindow):
                 it.keep = None
                 self.pool.append(it); self.id2item[it.id] = it
 
+        steps_read  = len(self._input_order)      
+        steps_alpha = total_items                 
+        N           = len(self.pool)               
+        steps_feat  = N                         
+        steps_pairs = (N * (N - 1)) // 2         
+
+        total_steps = steps_read + steps_alpha + steps_feat + steps_pairs
+        if total_steps <= 0:
+            total_steps = 1
+
+        self.progress.setRange(0, total_steps)
+
+        done = steps_read + steps_alpha
+        self.progress.setValue(done)
+        QtWidgets.QApplication.processEvents()
+
         phash_primary: Dict[str, int]    = {}
         phash_secondary: Dict[str, int]  = {}
         phash_u: Dict[str, int]          = {}
@@ -1701,6 +1721,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
             area_map[it.id]  = content_area_ratio(it.rgba, self.alpha_thr)
             hgram_map[it.id] = gray_hist32(it.rgba, self.alpha_thr)
+
+            done += 1
+            if self.progress.maximum() > 0:
+                self.progress.setValue(done)
 
         if getattr(self, "features", None) and getattr(self, "project_root", None):
             temp_id_map = {i.id: i for i in self.pool}
@@ -1811,6 +1835,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.in_pair_ids.update([A.id, B.id])
                 self.pairs.append(PairHit(A.id, B.id, best))
 
+                done += 1
+                if self.progress.maximum() > 0:
+                    self.progress.setValue(done)
+
         if getattr(self, "project_root", None):
             write_results(self.project_root, self.pairs, self.id2item)
         if hasattr(self, "group_view"):
@@ -1821,6 +1849,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lb_pairs.setText(f"相似結果：{len(self.pairs)} 組（{group_cnt} 群）")
         self.sb_text.setText("配對完成，請於下方查看群組結果")
         self._refresh_file_list_grouped_mode()
+        if self.progress.maximum() > 0:
+            self.progress.setValue(self.progress.maximum())
 
     def on_export(self):
         if not self.pool:
