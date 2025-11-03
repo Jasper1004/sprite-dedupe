@@ -198,73 +198,78 @@ class MainWindow(QtWidgets.QMainWindow):
         self.progress.setRange(0, 0)
         self.progress.setValue(0)
 
-
     def _update_info_panel(self, uuid_: str | None, sub_id: int | None, group_id: str | None):
-        """將目前選擇的成員或群組寫到右側 infoPanel。"""
-        if not self._info_labels:
-            return
-        lab_uuid, lab_child, lab_size, lab_origin, lab_path, lab_phash, lab_dups = self._info_labels
-        def set_(w, v): w.setText(str(v) if w else "-")
+        """Delegate info panel updates to GroupResultsWidget which owns the info panel."""
+        if hasattr(self, "group_view") and hasattr(self.group_view, "_update_info_panel"):
+            return self.group_view._update_info_panel(uuid_, sub_id, group_id)
+        return
 
-        if uuid_ is None and group_id:
-            grp = next((g for g in (self.groups or []) if g.get("group_id") == group_id), None)
-            mems = grp.get("members", []) if grp else []
-            set_(lab_uuid,  "-")
-            set_(lab_child, "-")
-            set_(lab_size,  "-")
-            set_(lab_origin, "群組")
-            set_(lab_path,   group_id)
-            set_(lab_phash,  "-")
-            set_(lab_dups,   len(mems) if mems else "-")
-            return
+    # def _update_info_panel(self, uuid_: str | None, sub_id: int | None, group_id: str | None):
+    #     """將目前選擇的成員或群組寫到右側 infoPanel。"""
+    #     if not self._info_labels:
+    #         return
+    #     lab_uuid, lab_child, lab_size, lab_origin, lab_path, lab_phash, lab_dups = self._info_labels
+    #     def set_(w, v): w.setText(str(v) if w else "-")
 
-        if not uuid_:
-            for w in (lab_uuid, lab_child, lab_size, lab_origin, lab_path, lab_phash, lab_dups):
-                set_(w, "-")
-            return
+    #     if uuid_ is None and group_id:
+    #         grp = next((g for g in (self.groups or []) if g.get("group_id") == group_id), None)
+    #         mems = grp.get("members", []) if grp else []
+    #         set_(lab_uuid,  "-")
+    #         set_(lab_child, "-")
+    #         set_(lab_size,  "-")
+    #         set_(lab_origin, "群組")
+    #         set_(lab_path,   group_id)
+    #         set_(lab_phash,  "-")
+    #         set_(lab_dups,   len(mems) if mems else "-")
+    #         return
 
-        feat = self._load_feat(uuid_) or {}
-        set_(lab_uuid, uuid_)
-        set_(lab_child, sub_id if sub_id is not None else "-")
+    #     if not uuid_:
+    #         for w in (lab_uuid, lab_child, lab_size, lab_origin, lab_path, lab_phash, lab_dups):
+    #             set_(w, "-")
+    #         return
 
-        if sub_id is None:
-            dims = feat.get("dimensions") or {}
-            set_(lab_size, f'{dims.get("width","-")}×{dims.get("height","-")}')
-            rel = feat.get("source_path")
-            set_(lab_origin, "散圖")
-            if rel:
-                full_path = rel if os.path.isabs(rel) else os.path.join(self.project_root, rel)
-                set_(lab_path, full_path)
-            else:
-                set_(lab_path, "-")
-        else:
-            set_(lab_origin, "組圖")
-            pu = uuid_ 
-            if pu:
-                mother = self._load_feat(pu) or {}
-                w = h = "-"
-                for si in (mother.get("sub_images") or []):
-                    if si.get("sub_id") == sub_id:
-                        x, y, w, h = si.get("bbox", (0, 0, 0, 0))
-                        break
-                set_(lab_size, f"{w}×{h}")
-                rel = mother.get("source_path")
-                if rel:
-                    full_path = rel if os.path.isabs(rel) else os.path.join(self.project_root, rel)
-                    set_(lab_path, full_path)
-                else:
-                    set_(lab_path, "-")
-            else:
-                set_(lab_size, "-")
-                set_(lab_path, "-")
+    #     feat = self._load_feat(uuid_) or {}
+    #     set_(lab_uuid, uuid_)
+    #     set_(lab_child, sub_id if sub_id is not None else "-")
 
-        if group_id:
-            grp = next((g for g in (self.groups or []) if g.get("group_id") == group_id), None)
-            set_(lab_dups, len(grp.get("members", [])) if grp else "-")
-        else:
-            set_(lab_dups, "-")
+    #     if sub_id is None:
+    #         dims = feat.get("dimensions") or {}
+    #         set_(lab_size, f'{dims.get("width","-")}×{dims.get("height","-")}')
+    #         rel = feat.get("source_path")
+    #         set_(lab_origin, "散圖")
+    #         if rel:
+    #             full_path = rel if os.path.isabs(rel) else os.path.join(self.project_root, rel)
+    #             set_(lab_path, full_path)
+    #         else:
+    #             set_(lab_path, "-")
+    #     else:
+    #         set_(lab_origin, "組圖")
+    #         pu = uuid_ 
+    #         if pu:
+    #             mother = self._load_feat(pu) or {}
+    #             w = h = "-"
+    #             for si in (mother.get("sub_images") or []):
+    #                 if si.get("sub_id") == sub_id:
+    #                     x, y, w, h = si.get("bbox", (0, 0, 0, 0))
+    #                     break
+    #             set_(lab_size, f"{w}×{h}")
+    #             rel = mother.get("source_path")
+    #             if rel:
+    #                 full_path = rel if os.path.isabs(rel) else os.path.join(self.project_root, rel)
+    #                 set_(lab_path, full_path)
+    #             else:
+    #                 set_(lab_path, "-")
+    #         else:
+    #             set_(lab_size, "-")
+    #             set_(lab_path, "-")
 
-        set_(lab_phash, "-")
+    #     if group_id:
+    #         grp = next((g for g in (self.groups or []) if g.get("group_id") == group_id), None)
+    #         set_(lab_dups, len(grp.get("members", [])) if grp else "-")
+    #     else:
+    #         set_(lab_dups, "-")
+
+    #     set_(lab_phash, "-")
 
     def _on_image_label_clicked(self, meta: dict):
         """處理在橫向群組中圖片縮圖的點擊事件"""
