@@ -15,6 +15,18 @@ from ..constants import (
     ALPHA_THR_DEFAULT, MIN_AREA_DEFAULT, MIN_SIZE_DEFAULT,
     SPRITESHEET_MIN_SEGMENTS_DEFAULT, SPRITESHEET_MIN_COVERAGE_DEFAULT,
     SINGLES_BUCKET_SHIFT,
+    PHASH_HAMMING_MAX,
+    SHAPE_ALPHA_THR,        
+    ASPECT_TOL,        
+    PHASH_SHAPE_MAX,
+    USE_SHAPE_CHECK,
+    PHASH_COLOR_MAX,
+    USE_COLOR_CHECK,
+    PHASH_EDGE_MAX,
+    USE_EDGE_CHECK,
+    ROT_EARLYSTOP_SLACK,
+    CONTENT_AREA_TOL,
+    HGRAM_CHISQ_MAX
 )
 
 from ..stores.index_store import IndexStore
@@ -54,6 +66,7 @@ from ..core.features import (
     content_area_ratio,
     gray_hist32,
     crop_aspect_ratio,
+    chisq_dist
 )
 
 from ..constants import (
@@ -99,10 +112,15 @@ class PairHit:
 # 放在檔案前半、MainWindow 定義之前
 from PyQt5 import QtCore
 
+# app/ui/main_window.py
+
 class ScanWorker(QtCore.QObject):
-    progressInit = QtCore.pyqtSignal(int)   # 總步數
-    progressStep = QtCore.pyqtSignal(int)   # 當前已完成步數
-    finished     = QtCore.pyqtSignal()
+    progressInit = QtCore.pyqtSignal(int, int)
+    progressStep = QtCore.pyqtSignal(int)
+    # 1. 修改 finished 信號，使其能回傳結果 (一個 dict)
+    finished     = QtCore.pyqtSignal(dict)
+    # 2. 增加一個日誌信號，回報目前狀態
+    logMessage   = QtCore.pyqtSignal(str)
 
     def __init__(self, task_args):
         super().__init__()
@@ -112,39 +130,369 @@ class ScanWorker(QtCore.QObject):
     @QtCore.pyqtSlot()
     def run(self):
         """
-        這裡把你原本做『掃描/特徵抽取/比對/分群/寫檔』的流程搬進來，
-        每完成一個「可計步」的項目就 emit progressStep。
+        這是背景執行緒的進入點。
+        MainWindow.on_run() 的所有耗時邏輯都在這裡。
         """
-        # 1) 先計算總步數（例如：要處理的影像數 + 後續比對數）
-        images = self.task_args.get("images", [])
-        pairs  = self.task_args.get("pairs", [])
-        total  = len(images) + len(pairs)
-        if total <= 0:
-            total = len(images)
+        
+        # 3. 從 task_args 解開所有需要的參數
+        input_order = self.task_args.get("input_order", [])
+        project_root = self.task_args.get("project_root")
+        alpha_thr = self.task_args.get("alpha_thr")
+        min_area = self.task_args.get("min_area")
+        min_size = self.task_args.get("min_size")
+        spr_min_segs = self.task_args.get("spr_min_segs")
+        spr_min_cover = self.task_args.get("spr_min_cover")
+        phash_hamming_max_intra = self.task_args.get("phash_hamming_max_intra")
+        phash_hamming_max = self.task_args.get("phash_hamming_max")
 
-        self.progressInit.emit(total if total > 0 else 0)
+        # 4. 準備本地變數 (儲存結果用)
+        local_items_raw = []
+        local_id2item = {}
+        local_pool = []
+        local_pairs = []
+        local_seen_pair_keys = set()
+        local_in_pair_ids = set()
+        local_sheet_meta = {}
+        
+        # (用於特徵快取)
+        features_store = FeatureStore(project_root)
+        index_store = IndexStore(project_root)
+        index_store.load()
 
-        done = 0
+        try:
+            # === (以下是從 MainWindow.on_run 剪下並貼上的程式碼) ===
+            
+            # --- 1. 讀取圖片 ---
+            self.logMessage.emit("步驟 1/4: 讀取圖片...")
+            total = len(input_order)
+            if total == 0:
+                self.finished.emit({"error": "No images to process."})
+                return
+                
+            steps_read = total
+            # ( ... 這裡貼上 on_run 855-867 行的讀檔迴圈 ... )
+            # ( ... 並將 self.items_raw -> local_items_raw ... )
+            # ( ... self.id2item -> local_id2item ... )
+            for idx, (uid, p) in enumerate(input_order):
+                if self._abort: return
+                try:
+                    rgba = read_image_rgba(p)
+                    name = os.path.basename(p)
+                    item = ImageItem(id=uid, src_path=p, rgba=rgba, display_name=name)
+                    local_items_raw.append(item)
+                    local_id2item[uid] = item
+                except Exception as e:
+                    self.logMessage.emit(f"[錯誤] 讀取 {p} 失敗: {e}")
 
-        # 2) 影像特徵抽取
-        for img in images:
-            if self._abort: break
-            # ... 原本對單張影像做的工作 ...
-            done += 1
+            # --- 2. 切割 Spritesheet ---
+            self.logMessage.emit("步驟 2/4: 偵測並切割 Spritesheet...")
+            steps_alpha = len(local_items_raw)
+            # ( ... 這裡貼上 on_run 873-909 行的 alpha_cc 邏輯 ... )
+            # ( ... 將 self.pool -> local_pool ... )
+            # ( ... self.id2item -> local_id2item ... )
+            # ( ... self.sheet_meta -> local_sheet_meta ... )
+            for idx, it in enumerate(local_items_raw, 1):
+                if self._abort: return
+                boxes_strict = alpha_cc_boxes(it.rgba, alpha_thr, min_area, min_size)
+                boxes_loose  = alpha_cc_boxes(it.rgba, alpha_thr, max(100, min_area // 2), max(4, min_size // 2))
+                is_sheet_strict = is_spritesheet(it.rgba, boxes_strict, spr_min_segs, spr_min_cover)
+                is_sheet_loose  = is_spritesheet(it.rgba, boxes_loose,  spr_min_segs, spr_min_cover)
+                use_boxes = boxes_strict if is_sheet_strict else (boxes_loose if is_sheet_loose else None)
+
+                if use_boxes is not None:
+                    parent_uuid = it.id
+                    rel_path = os.path.relpath(it.src_path, project_root) if project_root and it.src_path else it.display_name
+                    local_sheet_meta[parent_uuid] = {
+                        "source_path": rel_path,
+                        "dimensions": {"width": int(it.rgba.shape[1]), "height": int(it.rgba.shape[0])},
+                        "sub_images": []
+                    }
+                    for i, (x, y, w, h) in enumerate(use_boxes):
+                        crop = trim_and_pad_rgba(it.rgba[y:y+h, x:x+w, :], pad=0)
+                        sub_id_str = f"sub_{i}"
+                        full_id = f"{parent_uuid}#{sub_id_str}"
+                        sub = ImageItem(id=full_id, src_path=None, rgba=crop, display_name=f"{it.display_name}#{sub_id_str}",
+                                        group_id=it.display_name, keep=None, parent_uuid=parent_uuid, sub_id=i, bbox=(x, y, w, h))
+                        local_pool.append(sub); local_id2item[sub.id] = sub
+                        local_sheet_meta[parent_uuid]["sub_images"].append(
+                            {"sub_id": i, "bbox": [int(x), int(y), int(w), int(h)], "sub_uuid": sub.id}
+                        )
+                else:
+                    it.keep = None
+                    local_pool.append(it); local_id2item[it.id] = it
+
+            # --- 3. 特徵提取 ---
+            self.logMessage.emit("步驟 3/4: 提取影像特徵...")
+            N = len(local_pool)
+            steps_feat = N
+            steps_pairs = (N * (N - 1)) // 2
+            total_steps = steps_read + steps_alpha + steps_feat + steps_pairs
+            self.progressInit.emit(0, total_steps if total_steps > 0 else 1)
+            
+            done = steps_read + steps_alpha
             self.progressStep.emit(done)
 
-        # 3) 兩兩比較/分群（如果有）
-        for p in pairs:
-            if self._abort: break
-            # ... 原本 pair 計算/旋轉搜尋/哈希比對 ...
-            done += 1
+            phash_primary, phash_secondary, phash_u, phash_v, phash_alpha, phash_edge = {}, {}, {}, {}, {}, {}
+            area_map, hgram_map = {}, {}
+
+            # ( ... 這裡貼上 on_run 931-984 行的特徵提取邏輯 ... )
+            # ( ... 為了簡化，快取邏輯 (if used_cache) 先移除 ... )
+            # ( ... 全部重新計算 ... )
+            for it in local_pool:
+                if self._abort: return
+                
+                used_cache = False
+                
+                # 1. 檢查 IndexStore 看檔案是否"乾淨"
+                is_clean = False
+                try:
+                    rel_path = index_store._uuid_to_rel.get(it.id) or index_store._uuid_to_rel.get(it.parent_uuid)
+                    if rel_path:
+                        meta = index_store.data.get("image_map", {}).get(rel_path)
+                        if meta and meta.get("uuid") in (it.id, it.parent_uuid):
+                            is_clean = not meta.get("dirty_features", True)
+                except Exception:
+                    is_clean = False
+
+                # 2. 如果乾淨，嘗試讀取
+                if is_clean:
+                    cf = self._load_cached_features_for_item(it, features_store) # 傳入 features_store
+                    if cf and "phash_primary" in cf:
+                        # 1. 為所有 pHash 提供預設值 0
+                        phash_primary[it.id]   = cf.get("phash_primary") or 0
+                        phash_secondary[it.id] = cf.get("phash_secondary") or 0
+                        phash_u[it.id]         = cf.get("phash_u") or 0
+                        phash_v[it.id]         = cf.get("phash_v")
+                        phash_alpha[it.id]     = cf.get("phash_alpha") or 0
+                        phash_edge[it.id]      = cf.get("phash_edge") or 0
+                        
+                        # 2. 為 area_ratio 提供預設值 0.0 (修復崩潰)
+                        area_map[it.id]        = cf.get("area_ratio") or 0.0
+                        
+                        # 3. 為 hgram 提供一個空的 np 陣列，而不是 None
+                        hgram_list = cf.get("hgram_gray32")
+                        if hgram_list is not None:
+                            hgram_map[it.id] = np.array(hgram_list, dtype=np.float32)
+                        else:
+                            hgram_map[it.id] = np.zeros(32, dtype=np.float32) # 使用 0 陣列
+                        
+                        used_cache = True
+
+                # 3. 如果沒有快取或快取"髒了"，才重新計算
+                if not used_cache:
+                    phash_primary[it.id]   = phash_from_canon_rgba(it.rgba, alpha_thr, pad_ratio=CANON_PAD_PRIMARY)
+                    phash_secondary[it.id] = phash_from_canon_rgba(it.rgba, alpha_thr, pad_ratio=CANON_PAD_SECONDARY)
+                    u, v = phash_from_canon_uv(it.rgba, alpha_thr, pad_ratio=CANON_PAD_PRIMARY)
+                    phash_u[it.id], phash_v[it.id] = u, v
+                    phash_alpha[it.id] = phash_from_canon_alpha(it.rgba, alpha_thr=SHAPE_ALPHA_THR, pad_ratio=CANON_PAD_SECONDARY)
+                    phash_edge[it.id]  = phash_from_canon_edge(it.rgba, alpha_thr=SHAPE_ALPHA_THR, pad_ratio=CANON_PAD_PRIMARY)
+                    area_map[it.id]  = content_area_ratio(it.rgba, alpha_thr)
+                    hgram_map[it.id] = gray_hist32(it.rgba, alpha_thr)
+                
+                done += 1
+                self.progressStep.emit(done)
+            
+            # --- 3b. 儲存特徵快取 (!!! 這是貼上的程式碼 !!!) ---
+            temp_id_map = {i.id: i for i in local_pool}
+
+            # 儲存 散圖 (Single Images)
+            for item in temp_id_map.values():
+                if item.parent_uuid is not None:
+                    continue 
+                
+                uuid_ = item.id
+                # (我們假設所有 features 都是新算的，所以總是儲存)
+                # (註解掉 mark_clean_by_uuid 檢查，強制寫入)
+                # if not index_store.mark_clean_by_uuid(uuid_):
+                #     continue 
+
+                hgram = hgram_map.get(uuid_)
+                feat = {
+                    "phash_primary": phash_primary.get(uuid_),
+                    "phash_secondary": phash_secondary.get(uuid_),
+                    "phash_u": phash_u.get(uuid_),
+                    "phash_v": phash_v.get(uuid_),
+                    "phash_alpha": phash_alpha.get(uuid_),
+                    "phash_edge": phash_edge.get(uuid_),
+                    "area_ratio": area_map.get(uuid_),
+                    "hgram_gray32": hgram.tolist() if hgram is not None else None,
+                }
+                
+                # 試圖從 index_store 取得 rel_path
+                rel_path = None
+                try:
+                    rel_path = index_store._uuid_to_rel.get(uuid_)
+                    if rel_path:
+                        meta = index_store.data.get("image_map", {}).get(rel_path) or {}
+                except Exception:
+                    meta = {}
+                
+                if not rel_path and item.src_path:
+                    try:
+                        rel_path = os.path.relpath(item.src_path, project_root)
+                    except ValueError:
+                        rel_path = item.src_path
+
+                payload = {
+                    "uuid": uuid_,
+                    "source_path": rel_path or item.display_name,
+                    "is_spritesheet": False,
+                    "dimensions": {"width": item.rgba.shape[1], "height": item.rgba.shape[0]},
+                    "features": feat,
+                }
+                features_store.save(uuid_, payload)
+                index_store.mark_clean_by_uuid(uuid_) # 儲存後標記為乾淨
+
+            # 儲存 組圖 (Spritesheets)
+            for parent_uuid, meta in local_sheet_meta.items():
+                # (強制儲存)
+                # if not index_store.mark_clean_by_uuid(parent_uuid):
+                #     continue
+                
+                updated_sub_images = []
+                for sub_info in meta.get("sub_images", []):
+                    sub_item_id = sub_info.get("sub_uuid")
+                    if not sub_item_id:
+                        continue
+                    
+                    hgram = hgram_map.get(sub_item_id)
+                    sub_feat = {
+                        "phash_primary": phash_primary.get(sub_item_id),
+                        "phash_secondary": phash_secondary.get(sub_item_id),
+                        "phash_u": phash_u.get(sub_item_id),
+                        "phash_v": phash_v.get(sub_item_id),
+                        "phash_alpha": phash_alpha.get(sub_item_id),
+                        "phash_edge": phash_edge.get(sub_item_id),
+                        "area_ratio": area_map.get(sub_item_id),
+                        "hgram_gray32": hgram.tolist() if hgram is not None else None,
+                    }
+                    
+                    new_sub_info = {
+                        "sub_id": sub_info["sub_id"],
+                        "bbox": sub_info["bbox"],
+                        "features": sub_feat 
+                    }
+                    updated_sub_images.append(new_sub_info)
+
+                mother_payload = {
+                    "uuid": parent_uuid,
+                    "source_path": meta.get("source_path"),
+                    "is_spritesheet": True,
+                    "dimensions": meta.get("dimensions"),
+                    "sub_images": updated_sub_images,
+                    "features": {} # 母圖本身不儲存特徵
+                }
+                features_store.save(parent_uuid, mother_payload)
+                index_store.mark_clean_by_uuid(parent_uuid) # 儲存後標記為乾淨
+            
+            # 確保 index.json 被寫回
+            index_store.save()
+            # --- 儲存邏輯結束 ---
+
+            # --- 4. N² 配對 ---
+            self.logMessage.emit("步驟 4/4: 執行相似度比對...")
+            
+            for i in range(N):
+                if self._abort: return
+                
+                # (移除 i 迴圈的進度更新)
+                # if i % 100 == 0: ...
+                    
+                for j in range(i + 1, N):
+                    
+                    # --- 修正開始 ---
+                    # 1. 將 done += 1 移到 J 迴圈的最頂部
+                    #    確保「每一次比對」都會推進度條
+                    done += 1
+                    
+                    # 2. (可選) 為了效能，不要 300 萬次都更新 UI
+                    #    改成每 1000 次比對才更新一次進度條
+                    if done % 1000 == 0:
+                        self.progressStep.emit(done)
+                    # --- 修正結束 ---
+                    
+                    A, B = local_pool[i], local_pool[j]
+                    aid, bid = A.id, B.id
+                    
+                    # ( ... 接下來是 TIER 1, 2, 3 的所有過濾邏輯 ... )
+                    same_group = (A.parent_uuid is not None and A.parent_uuid == B.parent_uuid)
+                    th = phash_hamming_max_intra if same_group else phash_hamming_max
+                    arA = crop_aspect_ratio(A.rgba, alpha_thr); arB = crop_aspect_ratio(B.rgba, alpha_thr)
+                    if abs(np.log((arA + 1e-6) / (arB + 1e-6))) > ASPECT_TOL and not same_group:
+                        continue # (現在 continue 之前已經計過數了)
+
+                    if abs(area_map[aid] - area_map[bid]) > CONTENT_AREA_TOL:
+                        continue # (現在 continue 之前已經計過數了)
+                    
+                    # ( ... TIER 3: best_rot_hamming_fast ... )
+                    best, ang = best_rot_hamming_fast(phash_primary[aid], B.rgba, alpha_thr=alpha_thr, early_stop_at=th + ROT_EARLYSTOP_SLACK)
+                    if best > th + ROT_EARLYSTOP_SLACK: 
+                        continue # (現在 continue 之前已經計過數了)
+                    
+                    key = (aid, bid) if aid < bid else (bid, aid)
+                    if key in local_seen_pair_keys:
+                        continue # (現在 continue 之前已經計過數了)
+                    
+                    local_seen_pair_keys.add(key)
+                    local_in_pair_ids.update([aid, bid])
+                    local_pairs.append(PairHit(aid, bid, best))
+                    
+                    # (移除 j 迴圈底部的 done += 1)
+
+            # (迴圈結束後，發送一次最終進度)
             self.progressStep.emit(done)
 
-        # 4) 結束
-        self.finished.emit()
+            # --- 5. 寫入 results.json ---
+            self.logMessage.emit("正在寫入結果...")
+            if project_root:
+                write_results(project_root, local_pairs, local_id2item)
+            
+            self.progressStep.emit(total_steps)
+
+            # 6. 打包結果回傳
+            results = {
+                "error": None,
+                "pairs": local_pairs,
+                "id2item": local_id2item,
+                "pool": local_pool,
+                "items_raw": local_items_raw,
+                "in_pair_ids": local_in_pair_ids,
+                "seen_pair_keys": local_seen_pair_keys,
+            }
+            self.finished.emit(results)
+
+        except Exception as e:
+            import traceback
+            err_msg = f"背景處理失敗: {e}\n{traceback.format_exc()}"
+            self.logMessage.emit(f"[嚴重錯誤] {err_msg}")
+            self.finished.emit({"error": err_msg})
 
     def abort(self):
         self._abort = True
+
+    def _load_cached_features_for_item(self, it, features_store: FeatureStore) -> dict | None:
+        """
+        單張：直接讀 {uuid}.json 的 features
+        子圖：讀母圖 {parent_uuid}.json -> sub_images[].features
+        """
+        try:
+            if getattr(it, "parent_uuid", None) is None:
+                # 這是散圖
+                feat = features_store.load(it.id)
+                return (feat or {}).get("features")
+            else:
+                # 這是子圖
+                mother = features_store.load(it.parent_uuid)
+                if not mother:
+                    return None
+                for si in (mother.get("sub_images") or []):
+                    # 比較 int == int
+                    if si.get("sub_id") == it.sub_id:
+                        return (si.get("features") or {})
+        except Exception as e:
+            self.logMessage.emit(f"[Cache Error] Failed to load {it.id}: {e}")
+            return None
+        return None
 
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
@@ -153,6 +501,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.index = None
         self.features = None
         self.logger = None
+        self.worker_thread = None
+        self.worker = None
         self.setWindowTitle(f"Sprite Dedupe {VERSION}")
         self.resize(1260, 780)
 
@@ -198,78 +548,73 @@ class MainWindow(QtWidgets.QMainWindow):
         self.progress.setRange(0, 0)
         self.progress.setValue(0)
 
+
     def _update_info_panel(self, uuid_: str | None, sub_id: int | None, group_id: str | None):
-        """Delegate info panel updates to GroupResultsWidget which owns the info panel."""
-        if hasattr(self, "group_view") and hasattr(self.group_view, "_update_info_panel"):
-            return self.group_view._update_info_panel(uuid_, sub_id, group_id)
-        return
+        """將目前選擇的成員或群組寫到右側 infoPanel。"""
+        if not self._info_labels:
+            return
+        lab_uuid, lab_child, lab_size, lab_origin, lab_path, lab_phash, lab_dups = self._info_labels
+        def set_(w, v): w.setText(str(v) if w else "-")
 
-    # def _update_info_panel(self, uuid_: str | None, sub_id: int | None, group_id: str | None):
-    #     """將目前選擇的成員或群組寫到右側 infoPanel。"""
-    #     if not self._info_labels:
-    #         return
-    #     lab_uuid, lab_child, lab_size, lab_origin, lab_path, lab_phash, lab_dups = self._info_labels
-    #     def set_(w, v): w.setText(str(v) if w else "-")
+        if uuid_ is None and group_id:
+            grp = next((g for g in (self.groups or []) if g.get("group_id") == group_id), None)
+            mems = grp.get("members", []) if grp else []
+            set_(lab_uuid,  "-")
+            set_(lab_child, "-")
+            set_(lab_size,  "-")
+            set_(lab_origin, "群組")
+            set_(lab_path,   group_id)
+            set_(lab_phash,  "-")
+            set_(lab_dups,   len(mems) if mems else "-")
+            return
 
-    #     if uuid_ is None and group_id:
-    #         grp = next((g for g in (self.groups or []) if g.get("group_id") == group_id), None)
-    #         mems = grp.get("members", []) if grp else []
-    #         set_(lab_uuid,  "-")
-    #         set_(lab_child, "-")
-    #         set_(lab_size,  "-")
-    #         set_(lab_origin, "群組")
-    #         set_(lab_path,   group_id)
-    #         set_(lab_phash,  "-")
-    #         set_(lab_dups,   len(mems) if mems else "-")
-    #         return
+        if not uuid_:
+            for w in (lab_uuid, lab_child, lab_size, lab_origin, lab_path, lab_phash, lab_dups):
+                set_(w, "-")
+            return
 
-    #     if not uuid_:
-    #         for w in (lab_uuid, lab_child, lab_size, lab_origin, lab_path, lab_phash, lab_dups):
-    #             set_(w, "-")
-    #         return
+        feat = self._load_feat(uuid_) or {}
+        set_(lab_uuid, uuid_)
+        set_(lab_child, sub_id if sub_id is not None else "-")
 
-    #     feat = self._load_feat(uuid_) or {}
-    #     set_(lab_uuid, uuid_)
-    #     set_(lab_child, sub_id if sub_id is not None else "-")
+        if sub_id is None:
+            dims = feat.get("dimensions") or {}
+            set_(lab_size, f'{dims.get("width","-")}×{dims.get("height","-")}')
+            rel = feat.get("source_path")
+            set_(lab_origin, "散圖")
+            if rel:
+                full_path = rel if os.path.isabs(rel) else os.path.join(self.project_root, rel)
+                set_(lab_path, full_path)
+            else:
+                set_(lab_path, "-")
+        else:
+            set_(lab_origin, "組圖")
+            pu = uuid_ 
+            if pu:
+                mother = self._load_feat(pu) or {}
+                w = h = "-"
+                for si in (mother.get("sub_images") or []):
+                    if si.get("sub_id") == sub_id:
+                        x, y, w, h = si.get("bbox", (0, 0, 0, 0))
+                        break
+                set_(lab_size, f"{w}×{h}")
+                rel = mother.get("source_path")
+                if rel:
+                    full_path = rel if os.path.isabs(rel) else os.path.join(self.project_root, rel)
+                    set_(lab_path, full_path)
+                else:
+                    set_(lab_path, "-")
+            else:
+                set_(lab_size, "-")
+                set_(lab_path, "-")
 
-    #     if sub_id is None:
-    #         dims = feat.get("dimensions") or {}
-    #         set_(lab_size, f'{dims.get("width","-")}×{dims.get("height","-")}')
-    #         rel = feat.get("source_path")
-    #         set_(lab_origin, "散圖")
-    #         if rel:
-    #             full_path = rel if os.path.isabs(rel) else os.path.join(self.project_root, rel)
-    #             set_(lab_path, full_path)
-    #         else:
-    #             set_(lab_path, "-")
-    #     else:
-    #         set_(lab_origin, "組圖")
-    #         pu = uuid_ 
-    #         if pu:
-    #             mother = self._load_feat(pu) or {}
-    #             w = h = "-"
-    #             for si in (mother.get("sub_images") or []):
-    #                 if si.get("sub_id") == sub_id:
-    #                     x, y, w, h = si.get("bbox", (0, 0, 0, 0))
-    #                     break
-    #             set_(lab_size, f"{w}×{h}")
-    #             rel = mother.get("source_path")
-    #             if rel:
-    #                 full_path = rel if os.path.isabs(rel) else os.path.join(self.project_root, rel)
-    #                 set_(lab_path, full_path)
-    #             else:
-    #                 set_(lab_path, "-")
-    #         else:
-    #             set_(lab_size, "-")
-    #             set_(lab_path, "-")
+        if group_id:
+            grp = next((g for g in (self.groups or []) if g.get("group_id") == group_id), None)
+            set_(lab_dups, len(grp.get("members", [])) if grp else "-")
+        else:
+            set_(lab_dups, "-")
 
-    #     if group_id:
-    #         grp = next((g for g in (self.groups or []) if g.get("group_id") == group_id), None)
-    #         set_(lab_dups, len(grp.get("members", [])) if grp else "-")
-    #     else:
-    #         set_(lab_dups, "-")
-
-    #     set_(lab_phash, "-")
+        set_(lab_phash, "-")
 
     def _on_image_label_clicked(self, meta: dict):
         """處理在橫向群組中圖片縮圖的點擊事件"""
@@ -1178,6 +1523,7 @@ class MainWindow(QtWidgets.QMainWindow):
         act_params = QtWidgets.QAction(QtGui.QIcon.fromTheme("preferences-system"), "參數…", self)
         act_params.setVisible(False)
         act_run = QtWidgets.QAction(QtGui.QIcon.fromTheme("system-run"), "開始處理", self)
+        act_run.setObjectName("act_run")
         self.act_theme = QtWidgets.QAction("🌗 主題", self)
         self.act_theme.setCheckable(True)
 
@@ -1709,281 +2055,114 @@ class MainWindow(QtWidgets.QMainWindow):
             self.spr_min_cover = e_cov.value()
             self.sb_text.setText("已更新參數")
 
+    # app/ui/main_window.py -> class MainWindow
+
     def on_run(self):
+        if self.worker_thread is not None:
+            QtWidgets.QMessageBox.information(self, "提示", "正在處理中，請稍候...")
+            return
+
         if not self._input_order:
             QtWidgets.QMessageBox.information(self, "提示", "請先新增圖片。")
             return
         
-        self.progress.setRange(0, 0)
+        # 1. 禁用按鈕，重設進度條
+        try:
+            # (您需要確保 "開始處理" 的 QAction 有一個 objectName)
+            # (或者在 _build_toolbar 時儲存 self.act_run)
+            self.findChild(QtWidgets.QAction, "act_run").setEnabled(False)
+        except Exception:
+            print("Warning: Cound not find act_run to disable.")
+            
+        self.sb_text.setText("正在準備...")
+        self.progress.setRange(0, 0) # 進入忙碌狀態
         self.progress.setValue(0)
-                    
-        self.items_raw.clear()
+        self.items_raw.clear() # 清理舊資料
         self.id2item.clear()
-        total = len(self._input_order)
-        for idx, (uid, p) in enumerate(self._input_order):
-            self.progress.setValue(int(idx * 50 / total))
-            try:
-                rgba = read_image_rgba(p)
-                name = os.path.basename(p)
-                item = ImageItem(id=uid, src_path=p, rgba=rgba, display_name=name)
-                self.items_raw.append(item)
-                self.id2item[uid] = item
-            except Exception as e:
-                print(f"Failed to read {p}: {e}")
-
-        self.sb_text.setText("正在處理…")
-        self.progress.setValue(50)
-        QtWidgets.QApplication.processEvents()
-
         self.pool.clear()
         self.pairs.clear()
 
-        self.sheet_meta = {}
+        # 2. 打包所有需要的參數
+        task_args = {
+            "input_order": list(self._input_order), # 傳遞副本
+            "project_root": self.project_root,
+            "alpha_thr": self.alpha_thr,
+            "min_area": self.min_area,
+            "min_size": self.min_size,
+            "spr_min_segs": self.spr_min_segs,
+            "spr_min_cover": self.spr_min_cover,
+            "phash_hamming_max_intra": self.phash_hamming_max_intra,
+            "phash_hamming_max": self.phash_hamming_max,
+        }
 
-        total_items = len(self.items_raw)
-        for idx, it in enumerate(self.items_raw, 1):
-            self.progress.setValue(50 + int(idx * 50 / max(total_items, 1)))
-            boxes_strict = alpha_cc_boxes(it.rgba, self.alpha_thr, self.min_area, self.min_size)
-            boxes_loose  = alpha_cc_boxes(it.rgba, self.alpha_thr, max(100, self.min_area // 2), max(4, self.min_size // 2))
+        # 3. 建立 Thread 和 Worker
+        self.worker_thread = QtCore.QThread()
+        self.worker = ScanWorker(task_args)
+        self.worker.moveToThread(self.worker_thread)
 
-            is_sheet_strict = is_spritesheet(it.rgba, boxes_strict, self.spr_min_segs, self.spr_min_cover)
-            is_sheet_loose  = is_spritesheet(it.rgba, boxes_loose,  self.spr_min_segs, self.spr_min_cover)
+        # 4. 連接信號
+        self.worker.progressInit.connect(self.progress.setRange)
+        self.worker.progressStep.connect(self.progress.setValue)
+        self.worker.logMessage.connect(self.sb_text.setText)
+        self.worker.finished.connect(self.on_run_finished) # <-- 新增的接收器
+        
+        self.worker_thread.started.connect(self.worker.run)
+        self.worker.finished.connect(self.worker_thread.quit)
+        self.worker.finished.connect(self.worker.deleteLater)
+        self.worker_thread.finished.connect(self.worker_thread.deleteLater)
+        self.worker_thread.finished.connect(self._on_worker_thread_finished) # <-- 新增的清理器
 
-            use_boxes = None
-            if is_sheet_strict:
-                use_boxes = boxes_strict
-            elif is_sheet_loose:
-                use_boxes = boxes_loose
+        # 5. 啟動
+        self.worker_thread.start()
 
-            if use_boxes is not None:
-                group = it.display_name
-                parent_uuid = it.id
-                rel_path = os.path.relpath(it.src_path, self.project_root) if self.project_root and it.src_path else it.display_name
-                self.sheet_meta[parent_uuid] = {
-                    "source_path": rel_path,
-                    "dimensions": {"width": int(it.rgba.shape[1]), "height": int(it.rgba.shape[0])},
-                    "sub_images": []
-                }
-                for i, (x, y, w, h) in enumerate(use_boxes):
-                    crop   = trim_and_pad_rgba(it.rgba[y:y+h, x:x+w, :], pad=0)
-                    sub_id_str = f"sub_{i}"
-                    full_id = f"{parent_uuid}#{sub_id_str}"
-                    sub = ImageItem(
-                        id=full_id, src_path=None, rgba=crop,
-                        display_name=f"{it.display_name}#{sub_id_str}",
-                        group_id=group, keep=None,
-                        parent_uuid=parent_uuid, sub_id=i, bbox=(x, y, w, h)
-                    )
-                    self.pool.append(sub); self.id2item[sub.id] = sub
-                    self.sheet_meta[parent_uuid]["sub_images"].append(
-                        {"sub_id": i, "bbox": [int(x), int(y), int(w), int(h)], "sub_uuid": sub.id}
-                    )
-            else:
-                it.keep = None
-                self.pool.append(it); self.id2item[it.id] = it
+    @QtCore.pyqtSlot()
+    def _on_worker_thread_finished(self):
+        """(私有) QThread 結束時，清理參照並重新啟用按鈕"""
+        self.worker_thread = None
+        self.worker = None
+        try:
+            self.findChild(QtWidgets.QAction, "act_run").setEnabled(True)
+        except Exception:
+            print("Warning: Could not find act_run to enable.")
 
-        steps_read  = len(self._input_order)      
-        steps_alpha = total_items                 
-        N           = len(self.pool)               
-        steps_feat  = N                         
-        steps_pairs = (N * (N - 1)) // 2         
+    @QtCore.pyqtSlot(dict)
+    def on_run_finished(self, results):
+        """(Slot) 接收 Worker 執行完畢的訊號"""
+        
+        # 1. 重設 UI
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
 
-        total_steps = steps_read + steps_alpha + steps_feat + steps_pairs
-        if total_steps <= 0:
-            total_steps = 1
+        # 2. 檢查錯誤
+        if results.get("error"):
+            self.sb_text.setText(f"處理失敗: {results['error']}")
+            QtWidgets.QMessageBox.critical(self, "處理失敗", results['error'])
+            return
 
-        self.progress.setRange(0, total_steps)
+        # 3. 將結果倒回 MainWindow
+        self.pairs = results.get("pairs", [])
+        self.id2item = results.get("id2item", {})
+        self.pool = results.get("pool", [])
+        self.items_raw = results.get("items_raw", [])
+        self.in_pair_ids = results.get("in_pair_ids", set())
+        self.seen_pair_keys = results.get("seen_pair_keys", set())
 
-        done = steps_read + steps_alpha
-        self.progress.setValue(done)
-        QtWidgets.QApplication.processEvents()
-
-        phash_primary: Dict[str, int]    = {}
-        phash_secondary: Dict[str, int]  = {}
-        phash_u: Dict[str, int]          = {}
-        phash_v: Dict[str, int]          = {}
-        phash_alpha: Dict[str, int]      = {}
-        phash_edge: Dict[str, int]       = {}
-        area_map: Dict[str, float]       = {}
-        hgram_map: Dict[str, np.ndarray] = {}
-
-        for it in self.pool:
-            used_cache = False
-            if getattr(self, "features", None):
-                if getattr(it, "parent_uuid", None) is None:
-                    if (not getattr(self, "index", None)) or self._index_is_clean_by_uuid(it.id):
-                        cf = self._load_cached_features_for_item(it)
-                        if cf and "phash_primary" in cf:
-                            phash_primary[it.id]   = int(cf.get("phash_primary", 0))
-                            phash_secondary[it.id] = int(cf.get("phash_secondary", 0))
-                            phash_u[it.id]         = int(cf.get("phash_u", 0))
-                            phash_v[it.id]         = int(cf.get("phash_v", 0))
-                            phash_alpha[it.id]     = int(cf.get("phash_alpha", 0))
-                            phash_edge[it.id]      = int(cf.get("phash_edge", 0))
-                            area_map[it.id]        = float(cf.get("content_area_ratio", 0.0))
-                            hgram_map[it.id]       = np.array(cf.get("gray_hist32", [0]*32), dtype=np.float32)
-                            used_cache = True
-                else:
-                    if (not getattr(self, "index", None)) or self._index_is_clean_by_uuid(it.parent_uuid):
-                        cf = self._load_cached_features_for_item(it)
-                        if cf and "phash_primary" in cf:
-                            phash_primary[it.id]   = int(cf.get("phash_primary", 0))
-                            phash_secondary[it.id] = int(cf.get("phash_secondary", 0))
-                            phash_u[it.id]         = int(cf.get("phash_u", 0))
-                            phash_v[it.id]         = int(cf.get("phash_v", 0))
-                            phash_alpha[it.id]     = int(cf.get("phash_alpha", 0))
-                            phash_edge[it.id]      = int(cf.get("phash_edge", 0))
-                            area_map[it.id]        = float(cf.get("content_area_ratio", 0.0))
-                            hgram_map[it.id]       = np.array(cf.get("gray_hist32", [0]*32), dtype=np.float32)
-                            used_cache = True
-
-            if used_cache:
-                done += 1
-                if self.progress.maximum() > 0:
-                    self.progress.setValue(done)
-                continue
-
-            phash_primary[it.id]   = phash_from_canon_rgba(it.rgba, self.alpha_thr, pad_ratio=CANON_PAD_PRIMARY)
-            phash_secondary[it.id] = phash_from_canon_rgba(it.rgba, self.alpha_thr, pad_ratio=CANON_PAD_SECONDARY)
-            u, v = phash_from_canon_uv(it.rgba, self.alpha_thr, pad_ratio=CANON_PAD_PRIMARY)
-            phash_u[it.id], phash_v[it.id] = u, v
-            
-            phash_alpha[it.id] = phash_from_canon_alpha(it.rgba, alpha_thr=SHAPE_ALPHA_THR, pad_ratio=CANON_PAD_SECONDARY)
-            phash_edge[it.id]  = phash_from_canon_edge(it.rgba, alpha_thr=SHAPE_ALPHA_THR, pad_ratio=CANON_PAD_PRIMARY)
-
-            area_map[it.id]  = content_area_ratio(it.rgba, self.alpha_thr)
-            hgram_map[it.id] = gray_hist32(it.rgba, self.alpha_thr)
-
-            done += 1
-            if self.progress.maximum() > 0:
-                self.progress.setValue(done)
-
-        if getattr(self, "features", None) and getattr(self, "project_root", None):
-            temp_id_map = {i.id: i for i in self.pool}
-
-            for item_id, item in temp_id_map.items():
-                if item.parent_uuid is not None:
-                    continue
-                crop_bbox = (0,0,0,0)
-                try:
-                    a = item.rgba[..., 3]
-                    ys, xs = np.where(a > self.alpha_thr) 
-                    if xs.size > 0:
-                        y0, y1 = ys.min(), ys.max() + 1
-                        x0, x1 = xs.min(), xs.max() + 1
-                        crop_bbox = (int(x0), int(y0), int(x1-x0), int(y1-y0))
-                    else:
-                        crop_bbox = (0, 0, int(item.rgba.shape[1]), int(item.rgba.shape[0]))
-                except Exception:
-                    crop_bbox = (0, 0, int(item.rgba.shape[1]), int(item.rgba.shape[0]))
-                feat = {
-                    "phash_primary": int(phash_primary.get(item_id, 0)),
-                    "phash_secondary": int(phash_secondary.get(item_id, 0)),
-                    "phash_u": int(phash_u.get(item_id, 0)),
-                    "phash_v": int(phash_v.get(item_id, 0)),
-                    "phash_alpha": int(phash_alpha.get(item_id, 0)),
-                    "phash_edge": int(phash_edge.get(item_id, 0)),
-                    "content_area_ratio": float(area_map.get(item_id, 0.0)),
-                    "gray_hist32": hgram_map.get(item_id, np.zeros(32)).tolist()
-                }
-                payload = {
-                    "uuid": item.id,
-                    "source_path": item.src_path,
-                    "dimensions": {"width": int(item.rgba.shape[1]), "height": int(item.rgba.shape[0])},
-                    "is_spritesheet": False,
-                    "parent_uuid": None,
-                    "sub_id": None,
-                    "bbox": crop_bbox,
-                    "sub_images": [],
-                    "features": feat
-                }
-                self.features.save(item.id, payload)
-                if self.index: self.index.mark_clean_by_uuid(item.id)
-
-            for parent_uuid, meta in self.sheet_meta.items():
-                
-                updated_sub_images = []
-                for sub_info in meta.get("sub_images", []):
-                    sub_item_id = sub_info.get("sub_uuid")
-                    if not sub_item_id or sub_item_id not in temp_id_map:
-                        continue
-                    sub_feat = {
-                        "phash_primary": int(phash_primary.get(sub_item_id, 0)),
-                        "phash_secondary": int(phash_secondary.get(sub_item_id, 0)),
-                        "phash_u": int(phash_u.get(sub_item_id, 0)),
-                        "phash_v": int(phash_v.get(sub_item_id, 0)),
-                        "phash_alpha": int(phash_alpha.get(sub_item_id, 0)),
-                        "phash_edge": int(phash_edge.get(sub_item_id, 0)),
-                        "content_area_ratio": float(area_map.get(sub_item_id, 0.0)),
-                        "gray_hist32": hgram_map.get(sub_item_id, np.zeros(32)).tolist()
-                    }
-                    
-                    new_sub_info = {
-                        "sub_id": sub_info["sub_id"],
-                        "bbox": sub_info["bbox"],
-                        "features": sub_feat
-                    }
-                    updated_sub_images.append(new_sub_info)
-
-                mother_payload = {
-                    "uuid": parent_uuid,
-                    "source_path": meta.get("source_path"),
-                    "dimensions": meta.get("dimensions"),
-                    "is_spritesheet": True,
-                    "parent_uuid": None,
-                    "sub_id": None,
-                    "bbox": None,
-                    "sub_images": updated_sub_images,
-                    "features": {}
-                }
-                
-                self.features.save(parent_uuid, mother_payload)
-                if self.index: self.index.mark_clean_by_uuid(parent_uuid)
-
-        self.pairs.clear()
-        self.in_pair_ids.clear()
-        self.seen_pair_keys.clear()
-
-        N = len(self.pool)
-        intra_candidates = [] 
-        for i in range(N):
-            for j in range(i + 1, N):
-                A, B = self.pool[i], self.pool[j]
-
-                same_group = (A.parent_uuid is not None and A.parent_uuid == B.parent_uuid)
-                th = self.phash_hamming_max_intra if same_group else self.phash_hamming_max
-
-                arA = crop_aspect_ratio(A.rgba, self.alpha_thr)
-                arB = crop_aspect_ratio(B.rgba, self.alpha_thr)
-                if abs(np.log((arA + 1e-6) / (arB + 1e-6))) > ASPECT_TOL and not same_group:
-                    continue
-
-                best, ang = best_rot_hamming_fast(phash_primary[A.id], B.rgba, alpha_thr=self.alpha_thr, early_stop_at=th + ROT_EARLYSTOP_SLACK)
-                if best > th + ROT_EARLYSTOP_SLACK: continue
-                
-                key = self._pair_key(A, B)
-                if key in self.seen_pair_keys: continue
-                self.seen_pair_keys.add(key)
-                self.in_pair_ids.update([A.id, B.id])
-                self.pairs.append(PairHit(A.id, B.id, best))
-
-                done += 1
-                if self.progress.maximum() > 0:
-                    self.progress.setValue(done)
-
+        # 4. 更新 UI (載入 group_view, 刷新左側列表)
         if getattr(self, "project_root", None):
-            write_results(self.project_root, self.pairs, self.id2item)
-        if hasattr(self, "group_view"):
-            self.group_view.load_from_results()
+            try:
+                # group_view 讀取 worker 剛才寫入的 results.json
+                self.group_view.load_from_results()
+            except Exception as e:
+                self.sb_text.setText(f"載入結果時出錯: {e}")
+                print(f"[ERROR] load_from_results failed: {e}")
 
         self.progress.setValue(100)
-        group_cnt = len(getattr(self, "object_groups", {}))
-        self.lb_pairs.setText(f"相似結果：{len(self.pairs)} 組（{group_cnt} 群）")
+        self.lb_pairs.setText(f"相似結果：{len(self.pairs)} 組")
         self.sb_text.setText("配對完成，請於下方查看群組結果")
+        
+        # 5. 刷新左側列表為「群組模式」
         self._refresh_file_list_grouped_mode()
-        if self.progress.maximum() > 0:
-            self.progress.setValue(self.progress.maximum())
-
+        self.progress.setValue(100)
 
     def on_export(self):
         if not self.pool:
