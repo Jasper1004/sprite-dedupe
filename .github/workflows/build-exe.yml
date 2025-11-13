@@ -1,5 +1,8 @@
 name: Build SpriteDedupe EXE
 
+permissions:
+  contents: write     # 👈 這一段是關鍵：允許建立/更新 Release
+
 on:
   push:
     tags:
