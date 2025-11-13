@@ -38,4 +38,5 @@ jobs:
           artifactContentType: application/octet-stream
           tag: ${{ github.ref_name }}              # 就是 v0.2.0 這個 tag
           allowUpdates: true                       # ✅ 允許更新同一個 Release
+          removeArtifacts: true
           token: ${{ secrets.GITHUB_TOKEN }}
