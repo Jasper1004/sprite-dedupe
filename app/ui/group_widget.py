@@ -1,7 +1,7 @@
 import os, sys, json, subprocess
 from typing import Optional, Tuple
 from PyQt5 import QtGui, QtCore, QtWidgets
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 from ..constants import (
     SHAPE_ALPHA_THR, PHASH_SHAPE_MAX, ASPECT_TOL, CANON_PAD_SECONDARY, SINGLES_GROUP_KEY, SINGLES_BUCKET_SHIFT
 )
@@ -11,6 +11,24 @@ from ..core.phash import (
 from ..core.features import crop_aspect_ratio
 from .widgets import BBoxGraphicsView
 from .dialogs import PairDecisionDialog as PairDialog
+
+class LRUCache:
+    def __init__(self, capacity=50):
+        self.cache = OrderedDict()
+        self.capacity = capacity
+    
+    def get(self, key):
+        if key not in self.cache:
+            return None
+        self.cache.move_to_end(key)
+        return self.cache[key]
+    
+    def put(self, key, value):
+        if key in self.cache:
+            self.cache.move_to_end(key)
+        self.cache[key] = value
+        if len(self.cache) > self.capacity:
+            self.cache.popitem(last=False)
 
 def _get_sig(obj: dict | None) -> str | None:
     if not isinstance(obj, dict):
@@ -69,9 +87,18 @@ class GroupResultsWidget(QtWidgets.QWidget):
         self.features_dir = None
         self.groups = []
         self.group_pairs_map = {}
+        self.member_item_map = {}
+        self.group_id_map = {}
+        self.sub_image_map_cache = LRUCache(capacity=50)
+        self.mother_pixmap_cache = LRUCache(capacity=20)
+        self.feature_json_cache = LRUCache(capacity=100)
 
         self.leftView  = BBoxGraphicsView(self)
         self.rightView = BBoxGraphicsView(self)
+
+        self.leftView.auto_key_white = False
+        self.rightView.auto_key_white = False
+
         self.leftView.setObjectName("sheetView")
         self.rightView.setObjectName("sheetView")
         self.leftView.setVisible(False)
@@ -160,47 +187,47 @@ class GroupResultsWidget(QtWidgets.QWidget):
             nodes.add(a); nodes.add(b)
             edges.append((a, b, p))
 
-        buckets = defaultdict(list)
+        # buckets = defaultdict(list)
 
-        for uuid_, feat in self.features_iter():
-            is_spritesheet = feat.get("is_spritesheet", False)
-            parent_uuid = feat.get("parent_uuid")
+        # for uuid_, feat in self.features_iter():
+        #     is_spritesheet = feat.get("is_spritesheet", False)
+        #     parent_uuid = feat.get("parent_uuid")
 
-            if parent_uuid is not None:
-                continue
+        #     if parent_uuid is not None:
+        #         continue
             
-            if is_spritesheet:
-                subs = feat.get("sub_images") or []
-                for i, sub in enumerate(subs):
-                    sk = _get_sig(sub) or _visual_bucket(sub)
-                    if sk:
-                        sid = sub.get("sub_id")
+        #     if is_spritesheet:
+        #         subs = feat.get("sub_images") or []
+        #         for i, sub in enumerate(subs):
+        #             sk = _get_sig(sub) or _visual_bucket(sub)
+        #             if sk:
+        #                 sid = sub.get("sub_id")
                         
-                        if isinstance(sid, str):
-                            if sid.startswith("sub_"):
-                                try:
-                                    sid = int(sid.split("_")[1])
-                                except Exception:
-                                    sid = i
-                            else:
-                                try:
-                                    sid = int(sid)
-                                except Exception:
-                                    sid = i
+        #                 if isinstance(sid, str):
+        #                     if sid.startswith("sub_"):
+        #                         try:
+        #                             sid = int(sid.split("_")[1])
+        #                         except Exception:
+        #                             sid = i
+        #                     else:
+        #                         try:
+        #                             sid = int(sid)
+        #                         except Exception:
+        #                             sid = i
 
-                        if sid is None:
-                            sid = i
+        #                 if sid is None:
+        #                     sid = i
                         
-                        buckets[sk].append((uuid_, sid))
+        #                 buckets[sk].append((uuid_, sid))
                         
-            else:
-                k = _get_sig(feat) or _visual_bucket(feat)
-                if k:
-                    buckets[k].append((uuid_, None))
+        #     else:
+        #         k = _get_sig(feat) or _visual_bucket(feat)
+        #         if k:
+        #             buckets[k].append((uuid_, None))
 
-        for members in buckets.values():
-            for (u, sid) in members:
-                nodes.add((u, sid))
+        # for members in buckets.values():
+        #     for (u, sid) in members:
+        #         nodes.add((u, sid))
 
         def _aspect_of_member(u, sid):
             member_id = f"{u}#sub_{sid}" if sid is not None else u
@@ -275,15 +302,15 @@ class GroupResultsWidget(QtWidgets.QWidget):
 
             return (shape_ok and ar_ok)
 
-        for members in buckets.values():
-            if len(members) < 2:
-                continue
-            for i in range(len(members)):
-                for j in range(i + 1, len(members)):
-                    a = members[i]; b = members[j]
-                    if not _compatible(a, b):
-                        continue
-                    edges.append((a, b, {"score": 1.0}))
+        # for members in buckets.values():
+        #     if len(members) < 2:
+        #         continue
+        #     for i in range(len(members)):
+        #         for j in range(i + 1, len(members)):
+        #             a = members[i]; b = members[j]
+        #             if not _compatible(a, b):
+        #                 continue
+        #             edges.append((a, b, {"score": 1.0}))
 
         if not nodes:
             return []
@@ -322,15 +349,45 @@ class GroupResultsWidget(QtWidgets.QWidget):
         def _bbox_of(u, sid):
             if sid is None: 
                 return None
-            mf = self._load_feat(u) or {}
-            parent_uuid = mf.get("parent_uuid")
-            if not parent_uuid:
+            
+            sub_map = self.sub_image_map_cache.get(u)
+            
+            if sub_map is None:
+                mother = self._load_feat(u) or {} 
+                if not mother.get("is_spritesheet", False):
+                    self.sub_image_map_cache.put(u, {})
+                    return None
+                
+                sub_map = {}
+                for si in mother.get("sub_images") or []:
+                    si_sid = si.get("sub_id")
+                    if si_sid is None:
+                        continue
+                    
+                    try:
+                        sub_map[int(si_sid)] = si.get("bbox")
+                    except (ValueError, TypeError):
+                        pass
+                
+                self.sub_image_map_cache.put(u, sub_map)
+
+            try:
+                return sub_map.get(int(sid))
+            except (ValueError, TypeError):
                 return None
-            mother = self._load_feat(parent_uuid) or {}
-            for si in mother.get("sub_images") or []:
-                if si.get("sub_id") == sid:
-                    return si.get("bbox")
-            return None
+
+        # def _bbox_of(u, sid):
+        #     if sid is None: 
+        #         return None
+        #     mf = self._load_feat(u) or {}
+        #     parent_uuid = mf.get("parent_uuid")
+        #     if not parent_uuid:
+        #         return None
+        #     mother = self._load_feat(parent_uuid) or {}
+        #     for si in mother.get("sub_images") or []:
+        #         if si.get("sub_id") == sid:
+        #             return si.get("bbox")
+        #     return None
 
         for root, mems in comp_members.items():
             if len(mems) < 2:
@@ -369,47 +426,66 @@ class GroupResultsWidget(QtWidgets.QWidget):
         """在右側樹中尋找指定 uuid (+ sub_id) 的 'member' 節點並選取；若找到回傳 True。"""
         if not hasattr(self, "tree") or self.tree is None:
             return False
+        
+        key = (uuid_, sub_id)
+        leaf = self.member_item_map.get(key)
+        
+        if leaf:
+            self.tree.setCurrentItem(leaf)
 
-        for i in range(self.tree.topLevelItemCount()):
-            root = self.tree.topLevelItem(i)
-            if root is None:
-                continue
-            for j in range(root.childCount()):
-                leaf = root.child(j)
-                if leaf is None:
-                    continue
-                meta = leaf.data(0, QtCore.Qt.UserRole) or {}
-                
-                if meta.get("type") != "member":
-                    continue
-                    
-                meta_uuid = meta.get("uuid")
-                meta_sub_id = meta.get("sub_id")
-                
-                if meta_uuid != uuid_:
-                    continue
-                    
-                if meta_sub_id is None and sub_id is None:
-                    pass
-                elif meta_sub_id is None or sub_id is None:
-                    continue
-                else:
-                    try:
-                        if int(meta_sub_id) != int(sub_id):
-                            continue
-                    except (ValueError, TypeError):
-                        if str(meta_sub_id) != str(sub_id):
-                            continue
-                self.tree.setCurrentItem(leaf)
-                self._last_selected_meta = meta
-                self._on_pair_tree_select()
+            meta = leaf.data(0, QtCore.Qt.UserRole) or {}
+            self._update_views_from_meta(meta)
+            # self._last_selected_meta = meta
+            # self._on_pair_tree_select()
 
-                for btn_name in ("btn_open_location", "btn_open_folder"):
-                    btn = getattr(self, btn_name, None)
-                    if btn:
-                        btn.setEnabled(True)
-                return True
+            for btn_name in ("btn_open_location", "btn_open_folder"):
+                btn = getattr(self, btn_name, None)
+                if btn:
+                    btn.setEnabled(True)
+            return True
+        
         return False
+
+        # for i in range(self.tree.topLevelItemCount()):
+        #     root = self.tree.topLevelItem(i)
+        #     if root is None:
+        #         continue
+        #     for j in range(root.childCount()):
+        #         leaf = root.child(j)
+        #         if leaf is None:
+        #             continue
+        #         meta = leaf.data(0, QtCore.Qt.UserRole) or {}
+                
+        #         if meta.get("type") != "member":
+        #             continue
+                    
+        #         meta_uuid = meta.get("uuid")
+        #         meta_sub_id = meta.get("sub_id")
+                
+        #         if meta_uuid != uuid_:
+        #             continue
+                    
+        #         if meta_sub_id is None and sub_id is None:
+        #             pass
+        #         elif meta_sub_id is None or sub_id is None:
+        #             continue
+        #         else:
+        #             try:
+        #                 if int(meta_sub_id) != int(sub_id):
+        #                     continue
+        #             except (ValueError, TypeError):
+        #                 if str(meta_sub_id) != str(sub_id):
+        #                     continue
+        #         self.tree.setCurrentItem(leaf)
+        #         self._last_selected_meta = meta
+        #         self._on_pair_tree_select()
+
+        #         for btn_name in ("btn_open_location", "btn_open_folder"):
+        #             btn = getattr(self, btn_name, None)
+        #             if btn:
+        #                 btn.setEnabled(True)
+        #         return True
+        # return False
 
     def set_project_root(self, root: str):
         self.project_root = root
@@ -425,11 +501,26 @@ class GroupResultsWidget(QtWidgets.QWidget):
             self.results = json.load(f)
 
         self.groups = self.results.get("similarity_groups", []) or self._build_groups_from_pairs(self.results)
+
+        self.group_id_map = {
+            g.get("group_id"): g 
+            for g in self.groups 
+            if g.get("group_id")
+        }
+
         self.group_pairs_map = {g.get("group_id"): g.get("pairs") or [] for g in self.groups}
         self._rebuild_tree()
 
     def _rebuild_tree(self):
         self.tree.clear()
+        self.member_item_map.clear()
+        # self.mother_pixmap_cache.clear()
+        # self.feature_json_cache.clear()
+
+        self.mother_pixmap_cache = LRUCache(capacity=20)
+        self.feature_json_cache = LRUCache(capacity=100)
+        self.sub_image_map_cache = LRUCache(capacity=50)
+
         if not self.groups:
             return
         for g in self.groups:
@@ -447,6 +538,9 @@ class GroupResultsWidget(QtWidgets.QWidget):
                     "-"
                 ])
                 leaf.setData(0, QtCore.Qt.UserRole, {"type":"member","group_id":gid,"uuid":uuid_,"sub_id":sid,"bbox":bbox})
+
+                self.member_item_map[(uuid_, sid)] = leaf
+
             root.setExpanded(True)
         if self.tree.topLevelItemCount() > 0:
             self.tree.setCurrentItem(self.tree.topLevelItem(0))
@@ -463,9 +557,21 @@ class GroupResultsWidget(QtWidgets.QWidget):
                     return parent_uuid, mother
         return None, None
 
+    # def _load_feat(self, uuid_: str):
+    #     if hasattr(self.main, "_load_feature_json"):
+    #         return self.main._load_feature_json(uuid_)
+    #     return None
+
     def _load_feat(self, uuid_: str):
+        cached_feat = self.feature_json_cache.get(uuid_)
+        if cached_feat is not None:
+            return cached_feat
+        
         if hasattr(self.main, "_load_feature_json"):
-            return self.main._load_feature_json(uuid_)
+            feat = self.main._load_feature_json(uuid_)
+            if feat:
+                self.feature_json_cache.put(uuid_, feat)
+                return feat
         return None
         
     def features_iter(self):
@@ -589,13 +695,41 @@ class GroupResultsWidget(QtWidgets.QWidget):
             self.pair_tree.setCurrentItem(self.pair_tree.topLevelItem(0))
             self._on_pair_tree_select()
     
+    # def _mother_pixmap(self, parent_uuid: str) -> QtGui.QPixmap | None:
+    #     mf = self._load_feat(parent_uuid)
+    #     if not mf or not mf.get("source_path") or not self.project_root:
+    #         return None
+    #     p = os.path.join(self.project_root, mf["source_path"])
+    #     pm = QtGui.QPixmap(p)
+    #     return pm if not pm.isNull() else None
+
     def _mother_pixmap(self, parent_uuid: str) -> QtGui.QPixmap | None:
+        cached_pm = self.mother_pixmap_cache.get(parent_uuid)
+        if cached_pm is not None:
+            return cached_pm
+
         mf = self._load_feat(parent_uuid)
         if not mf or not mf.get("source_path") or not self.project_root:
             return None
+        
         p = os.path.join(self.project_root, mf["source_path"])
+        if not os.path.exists(p):
+            return None
+            
         pm = QtGui.QPixmap(p)
-        return pm if not pm.isNull() else None
+
+        if pm.isNull():
+            return None
+            
+        MAX_SIZE = 2048
+        if pm.width() > MAX_SIZE or pm.height() > MAX_SIZE:
+            pm = pm.scaled(
+                MAX_SIZE, MAX_SIZE,
+                QtCore.Qt.KeepAspectRatio,
+                QtCore.Qt.SmoothTransformation
+            )
+        self.mother_pixmap_cache.put(parent_uuid, pm)
+        return pm
 
     def _crop_from_sheet(self, parent_uuid: str, bbox) -> QtGui.QPixmap | None:
         pm = self._mother_pixmap(parent_uuid)
@@ -606,18 +740,15 @@ class GroupResultsWidget(QtWidgets.QWidget):
         if r.isEmpty():
             return None
         return pm.copy(r)
-    
-    def _on_pair_tree_select(self):
-        """群組樹／成員被點選時：右側顯示影像 + 更新資訊欄。"""
-        it = self.tree.currentItem() if hasattr(self, "tree") else None
-        self._last_selected_meta = None
+
+    def _update_views_from_meta(self, meta: dict | None):
+        """(私有) 根據 meta 字典更新右側視圖和資訊面板。"""
+        self._last_selected_meta = meta
         self.rightView.clear()
-        if not it:
+
+        if not meta:
             self._update_info_panel(None, None, None)
             return
-
-        meta = it.data(0, QtCore.Qt.UserRole) or {}
-        self._last_selected_meta = meta
 
         if meta.get("type") == "group":
             gid = meta.get("group_id") or meta.get("parent_uuid")
@@ -630,47 +761,163 @@ class GroupResultsWidget(QtWidgets.QWidget):
         self.current_uuid = uuid_
 
         if sub_id is not None:
+            # --- (這是原 _on_pair_tree_select 的子圖邏輯) ---
             parent_uuid = uuid_ 
+            target_bbox_coords = meta.get("bbox")
             mother = self._load_feat(parent_uuid) or {}
             rel = mother.get("source_path")
-            
             if rel and self.project_root:
                 pm = self._mother_pixmap(parent_uuid)
                 if pm:
                     self.rightView.show_image(pm, fit=True)
-                    
-                    all_bboxes = (mother.get("sub_images") or [])
-                    target_bbox = None
-                    
-                    id_to_find = sub_id 
-
-                    for si in all_bboxes:
-                        if si.get("sub_id") == id_to_find:
-                            target_bbox = si
-                            break
-                    
-                    if target_bbox:
-                        original_sid_str = str(id_to_find)
-                        
-                        self.rightView.draw_bboxes([target_bbox]) #
-                        self.rightView.focus_bbox(original_sid_str) #
-            
+                    if target_bbox_coords:
+                        original_sid_str = str(sub_id)
+                        target_bbox_dict = {
+                            "sub_id": original_sid_str, 
+                            "bbox": target_bbox_coords
+                        }
+                        self.rightView.draw_bboxes([target_bbox_dict])
+                        self.rightView.focus_bbox(original_sid_str)
             self._update_info_panel(uuid_, sub_id, gid)
             if hasattr(self, "btn_open_folder"):
                 self.btn_open_folder.setEnabled(bool(rel))
             return
-
-        feat = self._load_feat(uuid_) or {} 
+        
+        # --- (這是原 _on_pair_tree_select 的散圖邏輯) ---
+        feat = self._load_feat(uuid_) or {}
         rel = feat.get("source_path")
         if rel and self.project_root:
             abs_p = os.path.join(self.project_root, rel)
-            pm = QtGui.QPixmap(abs_p)
-            if not pm.isNull():
+            
+            # --- 【LRU 修正】---
+            pm = self.mother_pixmap_cache.get(uuid_)
+            if pm is None:
+                if os.path.exists(abs_p):
+                    pm = QtGui.QPixmap(abs_p)
+                    if not pm.isNull():
+                        # 錯誤：self.mother_pixmap_cache[uuid_] = pm
+                        self.mother_pixmap_cache.put(uuid_, pm) # 正確：使用 .put()
+            # --- 【LRU 修正結束】---
+
+            if pm and not pm.isNull():
                 self.rightView.show_image(pm, fit=True)
         
         self._update_info_panel(uuid_, None, gid)
         if hasattr(self, "btn_open_folder"):
             self.btn_open_folder.setEnabled(bool(rel))
+
+    def _on_pair_tree_select(self):
+        """群組樹／成員被點選時：右側顯示影像 + 更新資訊欄。"""
+        it = self.tree.currentItem() if hasattr(self, "tree") else None
+        if not it:
+            self._update_views_from_meta(None)
+            return
+
+        meta = it.data(0, QtCore.Qt.UserRole) or {}
+        self._update_views_from_meta(meta)
+    
+    # def _on_pair_tree_select(self):
+    #     """群組樹／成員被點選時：右側顯示影像 + 更新資訊欄。"""
+    #     it = self.tree.currentItem() if hasattr(self, "tree") else None
+    #     self._last_selected_meta = None
+    #     self.rightView.clear()
+    #     if not it:
+    #         self._update_info_panel(None, None, None)
+    #         return
+
+    #     meta = it.data(0, QtCore.Qt.UserRole) or {}
+    #     self._last_selected_meta = meta
+
+    #     if meta.get("type") == "group":
+    #         gid = meta.get("group_id") or meta.get("parent_uuid")
+    #         self._update_info_panel(None, None, gid)
+    #         return
+        
+    #     uuid_  = meta.get("uuid")
+    #     sub_id = meta.get("sub_id")
+    #     gid    = meta.get("group_id")
+    #     self.current_uuid = uuid_
+
+    #     if sub_id is not None:
+    #         parent_uuid = uuid_ 
+    #         target_bbox_coords = meta.get("bbox")
+
+    #         mother = self._load_feat(parent_uuid) or {}
+    #         rel = mother.get("source_path")
+
+    #         if rel and self.project_root:
+    #             pm = self._mother_pixmap(parent_uuid)
+    #             if pm:
+    #                 self.rightView.show_image(pm, fit=True)
+                    
+    #                 # 如果 meta 中有 bbox 資訊，就用它來繪圖
+    #                 if target_bbox_coords:
+    #                     original_sid_str = str(sub_id)
+                        
+    #                     # draw_bboxes 期望的格式是 dict list
+    #                     target_bbox_dict = {
+    #                         "sub_id": original_sid_str, 
+    #                         "bbox": target_bbox_coords
+    #                     }
+                        
+    #                     self.rightView.draw_bboxes([target_bbox_dict])
+    #                     self.rightView.focus_bbox(original_sid_str)
+                    
+    #         self._update_info_panel(uuid_, sub_id, gid)
+            
+    #         # if rel and self.project_root:
+    #         #     pm = self._mother_pixmap(parent_uuid)
+    #         #     if pm:
+    #         #         self.rightView.show_image(pm, fit=True)
+                    
+    #         #         all_bboxes = (mother.get("sub_images") or [])
+    #         #         target_bbox = None
+                    
+    #         #         id_to_find = sub_id 
+
+    #         #         for si in all_bboxes:
+    #         #             if si.get("sub_id") == id_to_find:
+    #         #                 target_bbox = si
+    #         #                 break
+                    
+    #         #         if target_bbox:
+    #         #             original_sid_str = str(id_to_find)
+                        
+    #         #             self.rightView.draw_bboxes([target_bbox]) #
+    #         #             self.rightView.focus_bbox(original_sid_str) #
+            
+    #         # self._update_info_panel(uuid_, sub_id, gid)
+
+    #         if hasattr(self, "btn_open_folder"):
+    #             self.btn_open_folder.setEnabled(bool(rel))
+    #         return
+
+    #     # feat = self._load_feat(uuid_) or {} 
+    #     # rel = feat.get("source_path")
+    #     # if rel and self.project_root:
+    #     #     abs_p = os.path.join(self.project_root, rel)
+    #     #     pm = QtGui.QPixmap(abs_p)
+    #     #     if not pm.isNull():
+    #     #         self.rightView.show_image(pm, fit=True)
+        
+    #     # self._update_info_panel(uuid_, None, gid)
+
+    #     feat = self._load_feat(uuid_) or {}
+    #     rel = feat.get("source_path")
+    #     if rel and self.project_root:
+    #         abs_p = os.path.join(self.project_root, rel)
+    #         pm = self.mother_pixmap_cache.get(uuid_)
+    #         if pm is None:
+    #             if os.path.exists(abs_p):
+    #                 pm = QtGui.QPixmap(abs_p)
+    #                 if not pm.isNull():
+    #                     self.mother_pixmap_cache[uuid_] = pm
+    #         if pm and not pm.isNull():
+    #             self.rightView.show_image(pm, fit=True)
+    #     self._update_info_panel(uuid_, None, gid)
+    
+    #     if hasattr(self, "btn_open_folder"):
+    #         self.btn_open_folder.setEnabled(bool(rel))
 
     def _show_one_side_sheet(self, view: BBoxGraphicsView, parent_uuid):
         view.clear()
@@ -1033,12 +1280,34 @@ class GroupResultsWidget(QtWidgets.QWidget):
             set_(lab_origin, "組圖")
             pu = uuid_  
             if pu:
+                # mother = self._load_feat(pu) or {}
+                # w = h = "-"
+                # for si in (mother.get("sub_images") or []):
+                #     if si.get("sub_id") == sub_id:
+                #         x, y, w, h = si.get("bbox", (0, 0, 0, 0))
+                #         break
+                # set_(lab_size, f"{w}×{h}")
+                # rel = mother.get("source_path")
+
+                bbox = None
+                if (hasattr(self, "_last_selected_meta") and 
+                    self._last_selected_meta and
+                    self._last_selected_meta.get("type") == "member" and
+                    self._last_selected_meta.get("uuid") == uuid_ and
+                    str(self._last_selected_meta.get("sub_id")) == str(sub_id)):
+                    bbox = self._last_selected_meta.get("bbox")
+
                 mother = self._load_feat(pu) or {}
-                w = h = "-"
-                for si in (mother.get("sub_images") or []):
-                    if si.get("sub_id") == sub_id:
-                        x, y, w, h = si.get("bbox", (0, 0, 0, 0))
-                        break
+                w, h = "-", "-"
+
+                if bbox and len(bbox) == 4:
+                    w, h = bbox[2], bbox[3]
+                # else:
+                #     for si in (mother.get("sub_images") or []):
+                #         if si.get("sub_id") == sub_id:
+                #             x, y, w, h = si.get("bbox", (0, 0, 0, 0))
+                #             break
+                
                 set_(lab_size, f"{w}×{h}")
                 rel = mother.get("source_path")
                 if rel:
@@ -1051,7 +1320,8 @@ class GroupResultsWidget(QtWidgets.QWidget):
                 set_(lab_path, "-")
 
         if group_id:
-            grp = next((g for g in (self.groups or []) if g.get("group_id") == group_id), None)
+            # grp = next((g for g in (self.groups or []) if g.get("group_id") == group_id), None)
+            grp = self.group_id_map.get(group_id)
             set_(lab_dups, len(grp.get("members", [])) if grp else "-")
         else:
             set_(lab_dups, "-")

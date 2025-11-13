@@ -2,7 +2,7 @@ from PyQt5 import QtCore
 from PyQt5.QtCore import Qt
 
 # ====== 預設參數 ======
-VERSION = "v0.1.0"
+VERSION = "v0.2.0"
 PHASH_HAMMING_MAX_DEFAULT = 8
 PHASH_HAMMING_MAX_INTRA_DEFAULT = 7
 ALPHA_THR_DEFAULT = 1
