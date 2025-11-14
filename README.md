@@ -26,13 +26,13 @@
 2.  下載最新版本的 `sprite-dedupe.macOS.zip` 檔案。
 3.  下載後，直接雙擊將壓縮檔解壓縮
 4.  之後先雙擊此 `sprite-dedupe.app`，應該會跳出下圖視窗
-![screenshot](docs/1.PNG)
+![screenshot](docs/1.png)
 5.  打開「系統設定」（System Settings），前往「隱私權與安全性」（Privacy & Security），如下圖
-![screenshot](docs/2.PNG)
+![screenshot](docs/2.png)
 6.  往下捲動，找到「安全性」（Security）區域，您應該會在這裡看到一行字，寫著已阻擋「"sprite-dedupe.app" 」以保護你的 Mac，請點擊右側「強制打開」，如下圖。
-![screenshot](docs/3.PNG)
+![screenshot](docs/3.png)
 7.  點擊強制打開後，就能使用本系統，應該會跳出下圖視窗
-![screenshot](docs/4.PNG)
+![screenshot](docs/4.png)
 
 ---
 
