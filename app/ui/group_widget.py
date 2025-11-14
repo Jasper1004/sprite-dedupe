@@ -761,7 +761,6 @@ class GroupResultsWidget(QtWidgets.QWidget):
         self.current_uuid = uuid_
 
         if sub_id is not None:
-            # --- (這是原 _on_pair_tree_select 的子圖邏輯) ---
             parent_uuid = uuid_ 
             target_bbox_coords = meta.get("bbox")
             mother = self._load_feat(parent_uuid) or {}
@@ -783,22 +782,18 @@ class GroupResultsWidget(QtWidgets.QWidget):
                 self.btn_open_folder.setEnabled(bool(rel))
             return
         
-        # --- (這是原 _on_pair_tree_select 的散圖邏輯) ---
         feat = self._load_feat(uuid_) or {}
         rel = feat.get("source_path")
         if rel and self.project_root:
             abs_p = os.path.join(self.project_root, rel)
             
-            # --- 【LRU 修正】---
             pm = self.mother_pixmap_cache.get(uuid_)
             if pm is None:
                 if os.path.exists(abs_p):
                     pm = QtGui.QPixmap(abs_p)
                     if not pm.isNull():
-                        # 錯誤：self.mother_pixmap_cache[uuid_] = pm
-                        self.mother_pixmap_cache.put(uuid_, pm) # 正確：使用 .put()
-            # --- 【LRU 修正結束】---
-
+                        self.mother_pixmap_cache.put(uuid_, pm)
+                        
             if pm and not pm.isNull():
                 self.rightView.show_image(pm, fit=True)
         
