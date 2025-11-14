@@ -213,6 +213,7 @@ class ScanWorker(QtCore.QObject):
                         )
                 else:
                     it.keep = None
+                    it.rgba = trim_and_pad_rgba(it.rgba, pad=0)
                     local_pool.append(it); local_id2item[it.id] = it
 
             self.logMessage.emit("步驟 3/4: 提取影像特徵...")
@@ -371,27 +372,107 @@ class ScanWorker(QtCore.QObject):
                                 local_seen_pair_keys.add(key)
                                 local_in_pair_ids.update([aid, bid])
                         
-                        continue 
-                    
+                            continue 
+
                     same_group = (A.parent_uuid is not None and A.parent_uuid == B.parent_uuid)
                     th = phash_hamming_max_intra if same_group else phash_hamming_max
-                    arA = crop_aspect_ratio(A.rgba, alpha_thr); arB = crop_aspect_ratio(B.rgba, alpha_thr)
+
+                    arA = crop_aspect_ratio(A.rgba, alpha_thr)
+                    arB = crop_aspect_ratio(B.rgba, alpha_thr)
                     if abs(np.log((arA + 1e-6) / (arB + 1e-6))) > ASPECT_TOL and not same_group:
-                        continue
+                        continue                
 
                     if abs(area_map[aid] - area_map[bid]) > CONTENT_AREA_TOL:
                         continue
-                    
-                    best, ang = best_rot_hamming_fast(phash_primary[aid], B.rgba, alpha_thr=alpha_thr, early_stop_at=th + ROT_EARLYSTOP_SLACK)
-                    if best > th + ROT_EARLYSTOP_SLACK: 
+
+                    # 形狀
+                    if USE_SHAPE_CHECK:
+                        ham_alpha = _hamming64(phash_alpha[aid], phash_alpha[bid])
+                        if ham_alpha > PHASH_SHAPE_MAX:
+                            continue
+
+                    # 邊緣
+                    if USE_EDGE_CHECK:
+                        ham_edge = _hamming64(phash_edge[aid], phash_edge[bid])
+                        if ham_edge > PHASH_EDGE_MAX:
+                            continue
+
+                    # 顏色 
+                    if USE_COLOR_CHECK:
+                        ham_u = _hamming64(phash_u[aid], phash_u[bid])
+                        ham_v = _hamming64(phash_v[aid], phash_v[bid])
+                        if (ham_u + ham_v) / 2.0 > PHASH_COLOR_MAX:
+                            continue
+
+                    hist_dist = chisq_dist(hgram_map[aid], hgram_map[bid])
+                    if hist_dist > HGRAM_CHISQ_MAX:
                         continue
-                    
+
+                    best, ang = best_rot_hamming_fast(
+                        phash_primary[aid],
+                        B.rgba,
+                        alpha_thr=alpha_thr,
+                        early_stop_at=th + ROT_EARLYSTOP_SLACK
+                    )
+
+                    if best > th:
+                        continue
+
                     if key in local_seen_pair_keys:
                         continue
-                    
+
                     local_seen_pair_keys.add(key)
                     local_in_pair_ids.update([aid, bid])
                     local_pairs.append(PairHit(aid, bid, best))
+
+                    
+                    # same_group = (A.parent_uuid is not None and A.parent_uuid == B.parent_uuid)
+                    # th = phash_hamming_max_intra if same_group else phash_hamming_max
+                    # arA = crop_aspect_ratio(A.rgba, alpha_thr); arB = crop_aspect_ratio(B.rgba, alpha_thr)
+                    # if abs(np.log((arA + 1e-6) / (arB + 1e-6))) > ASPECT_TOL and not same_group:
+                    #     continue
+
+                    # # if abs(area_map[aid] - area_map[bid]) > CONTENT_AREA_TOL:
+                    # #     continue
+                    
+                    # # best, ang = best_rot_hamming_fast(phash_primary[aid], B.rgba, alpha_thr=alpha_thr, early_stop_at=th + ROT_EARLYSTOP_SLACK)
+                    # # if best > th + ROT_EARLYSTOP_SLACK: 
+                    # #     continue
+
+                    # if abs(area_map[aid] - area_map[bid]) > CONTENT_AREA_TOL:
+                    #     continue
+
+                    # # 形狀
+                    # ham_alpha = _hamming64(phash_alpha[aid], phash_alpha[bid])
+                    # if ham_alpha > PHASH_SHAPE_MAX:
+                    #     continue
+
+                    # # 邊緣
+                    # ham_edge = _hamming64(phash_edge[aid], phash_edge[bid])
+                    # if ham_edge > PHASH_EDGE_MAX:
+                    #     continue
+
+                    # # 顏色 
+                    # ham_u = _hamming64(phash_u[aid], phash_u[bid])
+                    # ham_v = _hamming64(phash_v[aid], phash_v[bid])
+                    # if (ham_u + ham_v) / 2.0 > PHASH_COLOR_MAX:
+                    #     continue
+                    
+                    # # 灰階直方圖 
+                    # hist_dist = chisq_dist(hgram_map[aid], hgram_map[bid])
+                    # if hist_dist > HGRAM_CHISQ_MAX:
+                    #     continue
+                    
+                    # best, ang = best_rot_hamming_fast(phash_primary[aid], B.rgba, alpha_thr=alpha_thr, early_stop_at=th + ROT_EARLYSTOP_SLACK)
+                    # if best > th: 
+                    #     continue
+                    
+                    # if key in local_seen_pair_keys:
+                    #     continue
+                    
+                    # local_seen_pair_keys.add(key)
+                    # local_in_pair_ids.update([aid, bid])
+                    # local_pairs.append(PairHit(aid, bid, best))
 
             self.progressStep.emit(done)
 
@@ -454,8 +535,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.worker_thread = None
         self.worker = None
 
-        self.thumb_json_cache = {}
-        self.thumb_pixmap_cache = {}
+        # self.thumb_json_cache = {}
+        # self.thumb_pixmap_cache = {}
+        self.feature_json_cache = LRUCache(capacity=100)
+        self.mother_pixmap_cache = LRUCache(capacity=50)
         self.thumb_scaled_base_cache = LRUCache(capacity=50)
         self.all_json_payloads = {}
 
@@ -742,13 +825,23 @@ class MainWindow(QtWidgets.QMainWindow):
             uuid_ = os.path.splitext(fn)[0]
             fp = os.path.join(feats_dir, fn)
 
-            data = self.thumb_json_cache.get(uuid_)
+            # data = self.thumb_json_cache.get(uuid_)
+
+            # if data is None:
+            #     try:
+            #         with open(fp, "r", encoding="utf-8") as f:
+            #             data = json.load(f)
+            #         self.thumb_json_cache[uuid_] = data
+            #     except Exception:
+            #         continue
+
+            data = self.feature_json_cache.get(uuid_)
 
             if data is None:
                 try:
                     with open(fp, "r", encoding="utf-8") as f:
                         data = json.load(f)
-                    self.thumb_json_cache[uuid_] = data
+                    self.feature_json_cache.put(uuid_, data)
                 except Exception:
                     continue
             
@@ -1100,78 +1193,207 @@ class MainWindow(QtWidgets.QMainWindow):
 
         return QtGui.QPixmap.fromImage(img)
 
+    # def _make_thumbnail_with_overlays(self, uuid_, sub_id=None, bbox=None, grouped=False, bg=None, border=None, target_size: int = 128) -> QtGui.QPixmap:
+    #     # feat = self._load_feature_json(uuid_) or {}
+    #     # feat = self.thumb_json_cache.get(uuid_)
+    #     # if feat is None:
+    #     #     feat = self._load_feature_json(uuid_) or {}
+    #     #     self.thumb_json_cache[uuid_] = feat
+
+    #     feat = self.feature_json_cache.get(uuid_)
+    #     if feat is None:
+    #         feat = self._load_feature_json(uuid_) or {}
+    #         self.feature_json_cache.put(uuid_, feat)
+        
+    #     item_id = f"{uuid_}#sub_{sub_id}" if sub_id is not None else uuid_
+    #     item = self.id2item.get(item_id) or self.id2item.get(uuid_)
+
+    #     base = None
+
+    #     if item is not None and getattr(item, "rgba", None) is not None:
+    #         try:
+    #             base = qpixmap_from_rgba(item.rgba)
+    #         except Exception:
+    #             base = None 
+
+    #     # if base is None or base.isNull():
+    #     #     rel = feat.get("source_path")
+            
+    #     #     base = QtGui.QPixmap()
+            
+    #     #     if self.project_root and rel:
+    #     #         if os.path.isabs(rel):
+    #     #             full_path = rel
+    #     #         else:
+    #     #             full_path = os.path.join(self.project_root, rel)
+
+    #     #         # base = self.thumb_pixmap_cache.get(full_path)
+
+    #     #         # if base is None and os.path.exists(full_path):
+    #     #         #     base = QtGui.QPixmap(full_path)
+    #     #         #     if not base.isNull():
+    #     #         #         self.thumb_pixmap_cache[full_path] = base
+
+    #     #         base = self.mother_pixmap_cache.get(full_path)
+
+    #     #         if base is None and os.path.exists(full_path):
+    #     #             base = QtGui.QPixmap(full_path)
+    #     #             if not base.isNull():
+    #     #                 self.mother_pixmap_cache.put(full_path, base)
+                
+    #     #         # if os.path.exists(full_path):
+    #     #         #     base = QtGui.QPixmap(full_path)
+
+    #     # if base is None:
+    #     #     base = QtGui.QPixmap()
+
+    #     # if (not isinstance(base, QtGui.QPixmap)) or base.isNull():
+    #     #     base = QtGui.QPixmap(128, 128)
+    #     #     base.fill(QtCore.Qt.darkGray)
+
+    #     if base is None or base.isNull():
+    #         base = self.mother_pixmap_cache.get(uuid_)
+
+    #         if base is None:
+    #             rel = feat.get("source_path")
+    #             if self.project_root and rel:
+    #                 if os.path.isabs(rel):
+    #                     full_path = rel
+    #                 else:
+    #                     full_path = os.path.join(self.project_root, rel)
+                    
+    #                 if os.path.exists(full_path):
+    #                     base = QtGui.QPixmap(full_path)
+    #                     if not base.isNull():
+    #                         MAX_SIZE = 2048
+    #                         if base.width() > MAX_SIZE or base.height() > MAX_SIZE:
+    #                             base = base.scaled(
+    #                                 MAX_SIZE, MAX_SIZE,
+    #                                 QtCore.Qt.KeepAspectRatio,
+    #                                 QtCore.Qt.SmoothTransformation
+    #                             )
+    #                         self.mother_pixmap_cache.put(uuid_, base)
+            
+    #         if base is None:
+    #             base = QtGui.QPixmap()
+
+    #     if (not isinstance(base, QtGui.QPixmap)) or base.isNull():
+    #         base = QtGui.QPixmap(128, 128)
+    #         base.fill(QtCore.Qt.darkGray)
+
+    #     # try:
+    #     #     base = self._apply_white_key(base)
+    #     # except Exception as e:
+    #     #     print(f"[WARN] _apply_white_key failed: {e}")
+
+    #     pm = QtGui.QPixmap(target_size, target_size)
+    #     pm.fill(QtCore.Qt.transparent)
+
+    #     base_cache_key = (base.cacheKey(), target_size)
+    #     scaled_base = self.thumb_scaled_base_cache.get(base_cache_key)
+
+    #     if scaled_base is None:
+    #         original_size = base.size()
+    #         q_target_size = QtCore.QSize(target_size, target_size)
+    #         scaled_size = original_size.scaled(q_target_size, QtCore.Qt.KeepAspectRatio)
+    
+    #         scaled_base = base.scaled(scaled_size, QtCore.Qt.IgnoreAspectRatio, QtCore.Qt.SmoothTransformation) # <-- 瓶頸
+            
+    #         self.thumb_scaled_base_cache.put(base_cache_key, scaled_base)
+        
+    #     # original_size = base.size()
+    #     # q_target_size = QtCore.QSize(target_size, target_size)
+    #     # scaled_size = original_size.scaled(q_target_size, QtCore.Qt.KeepAspectRatio)
+
+    #     # scaled_base = base.scaled(scaled_size, QtCore.Qt.IgnoreAspectRatio, QtCore.Qt.SmoothTransformation)
+
+    #     painter = QtGui.QPainter(pm)
+    #     painter.setRenderHint(QtGui.QPainter.Antialiasing)
+        
+    #     if grouped and bg:
+    #         painter.fillRect(pm.rect(), bg)
+
+    #     x_offset = (pm.width() - scaled_base.width()) // 2
+    #     y_offset = (pm.height() - scaled_base.height()) // 2
+
+    #     painter.drawPixmap(x_offset, y_offset, scaled_base)
+        
+    #     if grouped and border:
+    #         painter.setPen(QtGui.QPen(border, 3))
+    #         painter.drawRect(pm.rect().adjusted(1, 1, -2, -2))
+
+    #     # if bbox and isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+    #     #     x, y, w, h = bbox
+    #     #     ow = base.width()
+    #     #     oh = base.height()
+            
+    #     #     if ow > 0 and oh > 0:
+    #     #         scale = min(pm.width() / float(ow), pm.height() / float(oh))
+                
+    #     #         rx = int(x * scale) + x_offset
+    #     #         ry = int(y * scale) + y_offset
+    #     #         rw = int(w * scale)
+    #     #         rh = int(h * scale)
+                
+    #     #         painter.setPen(QtGui.QPen(QtGui.QColor(255, 128, 0, 230), 3))
+    #     #         painter.drawRect(QtCore.QRect(rx, ry, rw, rh))
+
+    #     painter.end()
+    #     return pm
+
     def _make_thumbnail_with_overlays(self, uuid_, sub_id=None, bbox=None, grouped=False, bg=None, border=None, target_size: int = 128) -> QtGui.QPixmap:
-        # feat = self._load_feature_json(uuid_) or {}
-        feat = self.thumb_json_cache.get(uuid_)
+        
+        feat = self.feature_json_cache.get(uuid_)
         if feat is None:
             feat = self._load_feature_json(uuid_) or {}
-            self.thumb_json_cache[uuid_] = feat
+            self.feature_json_cache.put(uuid_, feat)
         
         item_id = f"{uuid_}#sub_{sub_id}" if sub_id is not None else uuid_
         item = self.id2item.get(item_id) or self.id2item.get(uuid_)
 
         base = None
+        scaled_base = None
 
         if item is not None and getattr(item, "rgba", None) is not None:
             try:
-                base = qpixmap_from_rgba(item.rgba)
-            except Exception:
-                base = None 
+                rgba_hash = hash(item.rgba.tobytes())
+                base_cache_key = (rgba_hash, target_size)
+                scaled_base = self.thumb_scaled_base_cache.get(base_cache_key)
 
-        if base is None or base.isNull():
-            rel = feat.get("source_path")
-            
-            base = QtGui.QPixmap()
-            
-            if self.project_root and rel:
-                if os.path.isabs(rel):
-                    full_path = rel
-                else:
-                    full_path = os.path.join(self.project_root, rel)
-
-                base = self.thumb_pixmap_cache.get(full_path)
-
-                if base is None and os.path.exists(full_path):
-                    base = QtGui.QPixmap(full_path)
-                    if not base.isNull():
-                        self.thumb_pixmap_cache[full_path] = base
+                if scaled_base is None:
+                    scaled_base = qpixmap_from_rgba(item.rgba, max_w=target_size, max_h=target_size)
+                    self.thumb_scaled_base_cache.put(base_cache_key, scaled_base)
                 
-                # if os.path.exists(full_path):
-                #     base = QtGui.QPixmap(full_path)
+            except Exception:
+                scaled_base = None
+        
+        if scaled_base is None:
+            rel = feat.get("source_path")
+            full_path = None
+            if self.project_root and rel:
+                full_path = rel if os.path.isabs(rel) else os.path.join(self.project_root, rel)
 
-        if base is None:
-            base = QtGui.QPixmap()
+            if full_path and os.path.exists(full_path):
+                temp_base = QtGui.QPixmap(full_path)
+                if not temp_base.isNull():
+                    base_cache_key = (temp_base.cacheKey(), target_size)
+                    scaled_base = self.thumb_scaled_base_cache.get(base_cache_key)
 
-        if (not isinstance(base, QtGui.QPixmap)) or base.isNull():
-            base = QtGui.QPixmap(128, 128)
-            base.fill(QtCore.Qt.darkGray)
-
-        # try:
-        #     base = self._apply_white_key(base)
-        # except Exception as e:
-        #     print(f"[WARN] _apply_white_key failed: {e}")
+                    if scaled_base is None:
+                        original_size = temp_base.size()
+                        q_target_size = QtCore.QSize(target_size, target_size)
+                        scaled_size = original_size.scaled(q_target_size, QtCore.Qt.KeepAspectRatio)
+                        scaled_base = temp_base.scaled(scaled_size, QtCore.Qt.IgnoreAspectRatio, QtCore.Qt.FastTransformation)
+                        self.thumb_scaled_base_cache.put(base_cache_key, scaled_base)
+            
+        if scaled_base is None or scaled_base.isNull():
+            scaled_base = QtGui.QPixmap(target_size, target_size)
+            scaled_base.fill(QtCore.Qt.darkGray)
+            return scaled_base
 
         pm = QtGui.QPixmap(target_size, target_size)
         pm.fill(QtCore.Qt.transparent)
-
-        base_cache_key = (base.cacheKey(), target_size)
-        scaled_base = self.thumb_scaled_base_cache.get(base_cache_key)
-
-        if scaled_base is None:
-            original_size = base.size()
-            q_target_size = QtCore.QSize(target_size, target_size)
-            scaled_size = original_size.scaled(q_target_size, QtCore.Qt.KeepAspectRatio)
-    
-            scaled_base = base.scaled(scaled_size, QtCore.Qt.IgnoreAspectRatio, QtCore.Qt.SmoothTransformation) # <-- 瓶頸
-            
-            self.thumb_scaled_base_cache.put(base_cache_key, scaled_base)
         
-        # original_size = base.size()
-        # q_target_size = QtCore.QSize(target_size, target_size)
-        # scaled_size = original_size.scaled(q_target_size, QtCore.Qt.KeepAspectRatio)
-
-        # scaled_base = base.scaled(scaled_size, QtCore.Qt.IgnoreAspectRatio, QtCore.Qt.SmoothTransformation)
-
         painter = QtGui.QPainter(pm)
         painter.setRenderHint(QtGui.QPainter.Antialiasing)
         
@@ -1187,25 +1409,8 @@ class MainWindow(QtWidgets.QMainWindow):
             painter.setPen(QtGui.QPen(border, 3))
             painter.drawRect(pm.rect().adjusted(1, 1, -2, -2))
 
-        # if bbox and isinstance(bbox, (list, tuple)) and len(bbox) == 4:
-        #     x, y, w, h = bbox
-        #     ow = base.width()
-        #     oh = base.height()
-            
-        #     if ow > 0 and oh > 0:
-        #         scale = min(pm.width() / float(ow), pm.height() / float(oh))
-                
-        #         rx = int(x * scale) + x_offset
-        #         ry = int(y * scale) + y_offset
-        #         rw = int(w * scale)
-        #         rh = int(h * scale)
-                
-        #         painter.setPen(QtGui.QPen(QtGui.QColor(255, 128, 0, 230), 3))
-        #         painter.drawRect(QtCore.QRect(rx, ry, rw, rh))
-
         painter.end()
         return pm
-
     
     def _on_select(self, uuid_, sub_id=None):
         self.current_selection = {"uuid": uuid_, "sub_id": sub_id}
@@ -1220,32 +1425,58 @@ class MainWindow(QtWidgets.QMainWindow):
         self.list_files.setRowCount(0)
         self.list_files.setColumnCount(1)
 
-        if not getattr(self, "object_groups", None):
-            self._build_object_groups()
-        groups = dict(self.object_groups or {})
+        groups = {}
 
-        if not groups:
-            try:
-                if not getattr(self, "project_root", None):
-                    raise RuntimeError("project_root is None")
-                res_p = os.path.join(self.project_root, ".image_cache", "results.json")
-                sim_groups = []
-                if os.path.exists(res_p):
-                    with open(res_p, "r", encoding="utf-8") as f:
-                        res = json.load(f)
-                    sim_groups = res.get("similarity_groups") or []
-                    if not sim_groups and hasattr(self, "group_view") and hasattr(self.group_view, "_build_groups_from_pairs"):
-                        sim_groups = self.group_view._build_groups_from_pairs(res)
+        # if not getattr(self, "object_groups", None):
+        #     self._build_object_groups()
+        # groups = dict(self.object_groups or {})
 
-                for g in sim_groups:
-                    gname = g.get("group_id") or "pairs"
-                    for m in (g.get("members") or []):
-                        groups.setdefault(gname, []).append({
-                            "uuid": m.get("uuid"), "sub_id": m.get("sub_id"), "bbox": m.get("bbox")
-                        })
-            except Exception as e:
-                print(f"[WARN] fallback to similarity_groups failed: {e}")
+        # if not groups:
+        #     try:
+        #         if not getattr(self, "project_root", None):
+        #             raise RuntimeError("project_root is None")
+        #         res_p = os.path.join(self.project_root, ".image_cache", "results.json")
+        #         sim_groups = []
+        #         if os.path.exists(res_p):
+        #             with open(res_p, "r", encoding="utf-8") as f:
+        #                 res = json.load(f)
+        #             sim_groups = res.get("similarity_groups") or []
+        #             if not sim_groups and hasattr(self, "group_view") and hasattr(self.group_view, "_build_groups_from_pairs"):
+        #                 sim_groups = self.group_view._build_groups_from_pairs(res)
 
+        #         for g in sim_groups:
+        #             gname = g.get("group_id") or "pairs"
+        #             for m in (g.get("members") or []):
+        #                 groups.setdefault(gname, []).append({
+        #                     "uuid": m.get("uuid"), "sub_id": m.get("sub_id"), "bbox": m.get("bbox")
+        #                 })
+        #     except Exception as e:
+        #         print(f"[WARN] fallback to similarity_groups failed: {e}")
+
+        try:
+            if not getattr(self, "project_root", None):
+                raise RuntimeError("project_root is None")
+            res_p = os.path.join(self.project_root, ".image_cache", "results.json")
+            sim_groups = []
+            if os.path.exists(res_p):
+                with open(res_p, "r", encoding="utf-8") as f:
+                    res = json.load(f)
+                
+                # 從 group_widget 獲取分群結果
+                sim_groups = self.group_view.groups 
+                
+                if not sim_groups and hasattr(self.group_view, "_build_groups_from_pairs"):
+                    sim_groups = self.group_view._build_groups_from_pairs(res)
+
+            for g in sim_groups:
+                gname = g.get("group_id") or "pairs"
+                for m in (g.get("members") or []):
+                    groups.setdefault(gname, []).append({
+                        "uuid": m.get("uuid"), "sub_id": m.get("sub_id"), "bbox": m.get("bbox")
+                    })
+        except Exception as e:
+            print(f"[WARN] loading similarity_groups failed: {e}")
+        
         if not groups:
             self.list_files.setRowCount(1)
             no_results_label = QtWidgets.QLabel("尚無分群結果")
@@ -1829,6 +2060,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         rlyt.addWidget(self.group_view, 1)
 
+        self.group_view.attach_caches(self.feature_json_cache, self.mother_pixmap_cache)
+
         splitter.addWidget(right_panel)
 
         splitter.setStretchFactor(0, 1)
@@ -2349,8 +2582,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._input_order.clear()
         self._input_paths.clear()
 
-        self.thumb_json_cache.clear()
-        self.thumb_pixmap_cache.clear()
+        self.feature_json_cache = LRUCache(capacity=100)
+        self.mother_pixmap_cache = LRUCache(capacity=50)
         self.thumb_scaled_base_cache = LRUCache(capacity=50)
 
         self.list_files.clear()
@@ -2500,15 +2733,25 @@ class MainWindow(QtWidgets.QMainWindow):
         self.in_pair_ids = results.get("in_pair_ids", set())
         self.seen_pair_keys = results.get("seen_pair_keys", set())
 
-        self.thumb_json_cache.clear()
-        self.thumb_pixmap_cache.clear()
+        # self.thumb_json_cache.clear()
+        # self.thumb_pixmap_cache.clear()
+        # self.thumb_scaled_base_cache = LRUCache(capacity=50)
+
+        # self.all_json_payloads = results.get("json_payloads", {})
+
+        # if self.all_json_payloads:
+        #     for uuid_, payload in self.all_json_payloads.items():
+        #         self.thumb_json_cache[uuid_] = payload
+
+        self.feature_json_cache = LRUCache(capacity=100)
+        self.mother_pixmap_cache = LRUCache(capacity=50)
         self.thumb_scaled_base_cache = LRUCache(capacity=50)
 
         self.all_json_payloads = results.get("json_payloads", {})
 
         if self.all_json_payloads:
             for uuid_, payload in self.all_json_payloads.items():
-                self.thumb_json_cache[uuid_] = payload
+                self.feature_json_cache.put(uuid_, payload)
 
         if getattr(self, "project_root", None):
             try:

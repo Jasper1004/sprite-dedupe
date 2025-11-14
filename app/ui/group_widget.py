@@ -89,9 +89,12 @@ class GroupResultsWidget(QtWidgets.QWidget):
         self.group_pairs_map = {}
         self.member_item_map = {}
         self.group_id_map = {}
+        # self.sub_image_map_cache = LRUCache(capacity=50)
+        # self.mother_pixmap_cache = LRUCache(capacity=20)
+        # self.feature_json_cache = LRUCache(capacity=100)
         self.sub_image_map_cache = LRUCache(capacity=50)
-        self.mother_pixmap_cache = LRUCache(capacity=20)
-        self.feature_json_cache = LRUCache(capacity=100)
+        self.mother_pixmap_cache = None
+        self.feature_json_cache = None
 
         self.leftView  = BBoxGraphicsView(self)
         self.rightView = BBoxGraphicsView(self)
@@ -132,6 +135,11 @@ class GroupResultsWidget(QtWidgets.QWidget):
         lay = QtWidgets.QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.addWidget(self.vsplit)
+
+    def attach_caches(self, feature_cache, pixmap_cache):
+        """由 MainWindow 傳入共享的快取物件。"""
+        self.feature_json_cache = feature_cache
+        self.mother_pixmap_cache = pixmap_cache
 
     def attach_external_info_panel(self, panel: QtWidgets.QWidget, labels: tuple):
         """由 MainWindow 傳入右側的 infoPanel 與 7 個 QLabel。"""
@@ -517,8 +525,8 @@ class GroupResultsWidget(QtWidgets.QWidget):
         # self.mother_pixmap_cache.clear()
         # self.feature_json_cache.clear()
 
-        self.mother_pixmap_cache = LRUCache(capacity=20)
-        self.feature_json_cache = LRUCache(capacity=100)
+        # self.mother_pixmap_cache = LRUCache(capacity=20)
+        # self.feature_json_cache = LRUCache(capacity=100)
         self.sub_image_map_cache = LRUCache(capacity=50)
 
         if not self.groups:
@@ -793,7 +801,7 @@ class GroupResultsWidget(QtWidgets.QWidget):
                     pm = QtGui.QPixmap(abs_p)
                     if not pm.isNull():
                         self.mother_pixmap_cache.put(uuid_, pm)
-                        
+
             if pm and not pm.isNull():
                 self.rightView.show_image(pm, fit=True)
         
