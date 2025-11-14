@@ -14,7 +14,10 @@
 
 1.  前往 **[GitHub Releases 頁面](https://github.com/Jasper1004/sprite-dedupe/releases)**
 2.  下載最新版本的 `sprite-dedupe.Windows.exe` 檔案。
-3.  下載後，直接雙擊執行即可。
+3.  下載後，直接雙擊，系統會跳出系統警告，如下圖。
+![screenshot](docs/5.PNG)
+4.  點選其他資訊，再點選仍要執行，如下圖。
+![screenshot](docs/6.PNG)
 
 ---
 
