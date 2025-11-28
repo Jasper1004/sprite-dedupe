@@ -91,6 +91,111 @@ except Exception:
 
 from PIL import Image
 
+class ThumbnailRunnable(QtCore.QRunnable):
+    """專門用於列表縮圖的背景任務：讀取 -> 裁切 -> 縮放"""
+    def __init__(self, path, uuid, sub_id, bbox, target_size, signal_emitter):
+        super().__init__()
+        self.path = path
+        self.uuid = uuid
+        self.sub_id = sub_id
+        self.bbox = bbox
+        self.target_size = target_size
+        self.emitter = signal_emitter # 共用 WorkerSignals 實例
+
+    @QtCore.pyqtSlot()
+    def run(self):
+        if not self.path or not os.path.exists(self.path):
+            return
+
+        reader = QtGui.QImageReader(self.path)
+        img = None
+        
+        # 1. 策略分流
+        if self.bbox and len(self.bbox) == 4:
+            # --- 情況 A：讀取子圖 ---
+            x, y, w, h = map(int, self.bbox)
+            reader.setClipRect(QtCore.QRect(x, y, w, h))
+            img = reader.read()
+        else:
+            # --- 情況 B：讀取整張圖 ---
+            # 讀取時先做一次粗略縮小，避免讀入巨型圖檔
+            orig_size = reader.size()
+            if not orig_size.isValid():
+                return
+
+            # 預讀取稍微大一點，保留畫質
+            scale_target = self.target_size * 2 
+            
+            if orig_size.width() > scale_target or orig_size.height() > scale_target:
+                scale_ratio = min(scale_target / orig_size.width(), scale_target / orig_size.height())
+                new_w = int(orig_size.width() * scale_ratio)
+                new_h = int(orig_size.height() * scale_ratio)
+                reader.setScaledSize(QtCore.QSize(new_w, new_h))
+            
+            img = reader.read()
+
+        if img is None or img.isNull():
+            return
+
+        # 2. 統一縮放至目標大小
+        if img.width() != self.target_size and img.height() != self.target_size:
+            # ★ 優化：智慧選擇縮放演算法
+            # 如果圖片還是很大 (例如子圖很大)，使用 FastTransformation 避免 CPU 飆高
+            # 如果圖片已經很小，使用 SmoothTransformation 保持品質
+            mode = QtCore.Qt.SmoothTransformation
+            if img.width() > 1000 or img.height() > 1000:
+                mode = QtCore.Qt.FastTransformation
+                
+            img = img.scaled(
+                self.target_size, self.target_size,
+                QtCore.Qt.KeepAspectRatio,
+                mode
+            )
+            
+        self.emitter.loaded.emit(img, self.path, self.uuid, self.sub_id, self.bbox)
+
+class WorkerSignals(QtCore.QObject):
+    """定義訊號，因為 QRunnable 本身沒有訊號"""
+    loaded = QtCore.pyqtSignal(QtGui.QImage, str, str, object, object) # img, path, cache_key, sub_id, bbox
+
+class ImageLoaderRunnable(QtCore.QRunnable):
+    """給 ThreadPool 使用的讀圖任務"""
+    def __init__(self, path, cache_key, sub_id, bbox):
+        super().__init__()
+        self.path = path
+        self.cache_key = cache_key
+        self.sub_id = sub_id
+        self.bbox = bbox
+        self.signals = WorkerSignals()
+
+    @QtCore.pyqtSlot()
+    def run(self):
+        if not self.path or not os.path.exists(self.path):
+            self.signals.loaded.emit(QtGui.QImage(), self.path, self.cache_key, self.sub_id, self.bbox)
+            return
+
+        reader = QtGui.QImageReader(self.path)
+        
+        # 1. 針對「子圖 (Sub-image)」的優化：只讀取裁切區域
+        # 這是解決光暈圖卡死的關鍵！如果光暈只是大圖的一小部分，我們只讀那一小塊。
+        if self.sub_id is not None and self.bbox and len(self.bbox) == 4:
+            x, y, w, h = map(int, self.bbox)
+            reader.setClipRect(QtCore.QRect(x, y, w, h))
+            img = reader.read()
+            self.signals.loaded.emit(img, self.path, self.cache_key, self.sub_id, self.bbox)
+            return
+
+        # 2. 針對「整張大圖」的優化：限制最大解析度
+        PREVIEW_MAX_SIZE = 1800 
+        
+        orig_size = reader.size()
+        if orig_size.isValid():
+            if orig_size.width() > PREVIEW_MAX_SIZE or orig_size.height() > PREVIEW_MAX_SIZE:
+                reader.setScaledSize(orig_size.scaled(PREVIEW_MAX_SIZE, PREVIEW_MAX_SIZE, QtCore.Qt.KeepAspectRatio))
+
+        img = reader.read()
+        self.signals.loaded.emit(img, self.path, self.cache_key, self.sub_id, self.bbox)
+
 class LRUCache:
     """LRU 快取"""
     def __init__(self, capacity=50):
@@ -537,9 +642,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # self.thumb_json_cache = {}
         # self.thumb_pixmap_cache = {}
-        self.feature_json_cache = LRUCache(capacity=100)
+        self.feature_json_cache = LRUCache(capacity=5000)
         self.mother_pixmap_cache = LRUCache(capacity=50)
-        self.thumb_scaled_base_cache = LRUCache(capacity=50)
+        self.thumb_scaled_base_cache = LRUCache(capacity=500)
         self.all_json_payloads = {}
 
         self.setWindowTitle(f"Sprite Dedupe {VERSION}")
@@ -587,81 +692,160 @@ class MainWindow(QtWidgets.QMainWindow):
         self.progress.setRange(0, 0)
         self.progress.setValue(0)
 
+        self._preview_timer = QtCore.QTimer(self)
+        self._preview_timer.setSingleShot(True)
+        self._preview_timer.setInterval(280)  # 延遲 180 毫秒，可視需求調整
+        self._preview_timer.timeout.connect(self._do_load_preview) # 時間到才執行真正載入
 
-    def _update_info_panel(self, uuid_: str | None, sub_id: int | None, group_id: str | None):
-        """將目前選擇的成員或群組寫到右側 infoPanel。"""
-        if not self._info_labels:
-            return
-        lab_uuid, lab_child, lab_size, lab_origin, lab_path, lab_phash, lab_dups = self._info_labels
-        def set_(w, v): w.setText(str(v) if w else "-")
+        self._current_loader = None     # 當前的讀取執行緒
+        self._loading_path = None
+        self._active_loaders = set()
 
-        if uuid_ is None and group_id:
-            grp = next((g for g in (self.groups or []) if g.get("group_id") == group_id), None)
-            mems = grp.get("members", []) if grp else []
-            set_(lab_uuid,  "-")
-            set_(lab_child, "-")
-            set_(lab_size,  "-")
-            set_(lab_origin, "群組")
-            set_(lab_path,   group_id)
-            set_(lab_phash,  "-")
-            set_(lab_dups,   len(mems) if mems else "-")
-            return
+        self._thread_pool = QtCore.QThreadPool()
+        self._thread_pool.setMaxThreadCount(4)
 
-        if not uuid_:
-            for w in (lab_uuid, lab_child, lab_size, lab_origin, lab_path, lab_phash, lab_dups):
-                set_(w, "-")
-            return
 
-        feat = self._load_feat(uuid_) or {}
-        set_(lab_uuid, uuid_)
-        set_(lab_child, sub_id if sub_id is not None else "-")
+    # def _update_info_panel(self, uuid_: str | None, sub_id: int | None, group_id: str | None):
+    #     """將目前選擇的成員或群組寫到右側 infoPanel。"""
+    #     if not self._info_labels:
+    #         return
+    #     lab_uuid, lab_child, lab_size, lab_origin, lab_path, lab_phash, lab_dups = self._info_labels
+    #     def set_(w, v): w.setText(str(v) if w else "-")
 
-        if sub_id is None:
-            dims = feat.get("dimensions") or {}
-            set_(lab_size, f'{dims.get("width","-")}×{dims.get("height","-")}')
-            rel = feat.get("source_path")
-            set_(lab_origin, "散圖")
-            if rel:
-                full_path = rel if os.path.isabs(rel) else os.path.join(self.project_root, rel)
-                set_(lab_path, full_path)
-            else:
-                set_(lab_path, "-")
-        else:
-            set_(lab_origin, "組圖")
-            pu = uuid_ 
-            if pu:
-                mother = self._load_feat(pu) or {}
-                w = h = "-"
-                for si in (mother.get("sub_images") or []):
-                    if si.get("sub_id") == sub_id:
-                        x, y, w, h = si.get("bbox", (0, 0, 0, 0))
-                        break
-                set_(lab_size, f"{w}×{h}")
-                rel = mother.get("source_path")
-                if rel:
-                    full_path = rel if os.path.isabs(rel) else os.path.join(self.project_root, rel)
-                    set_(lab_path, full_path)
-                else:
-                    set_(lab_path, "-")
-            else:
-                set_(lab_size, "-")
-                set_(lab_path, "-")
+    #     if uuid_ is None and group_id:
+    #         grp = next((g for g in (self.groups or []) if g.get("group_id") == group_id), None)
+    #         mems = grp.get("members", []) if grp else []
+    #         set_(lab_uuid,  "-")
+    #         set_(lab_child, "-")
+    #         set_(lab_size,  "-")
+    #         set_(lab_origin, "群組")
+    #         set_(lab_path,   group_id)
+    #         set_(lab_phash,  "-")
+    #         set_(lab_dups,   len(mems) if mems else "-")
+    #         return
 
-        if group_id:
-            grp = next((g for g in (self.groups or []) if g.get("group_id") == group_id), None)
-            set_(lab_dups, len(grp.get("members", [])) if grp else "-")
-        else:
-            set_(lab_dups, "-")
+    #     if not uuid_:
+    #         for w in (lab_uuid, lab_child, lab_size, lab_origin, lab_path, lab_phash, lab_dups):
+    #             set_(w, "-")
+    #         return
 
-        set_(lab_phash, "-")
+    #     feat = self._load_feat(uuid_) or {}
+    #     set_(lab_uuid, uuid_)
+    #     set_(lab_child, sub_id if sub_id is not None else "-")
+
+    #     if sub_id is None:
+    #         dims = feat.get("dimensions") or {}
+    #         set_(lab_size, f'{dims.get("width","-")}×{dims.get("height","-")}')
+    #         rel = feat.get("source_path")
+    #         set_(lab_origin, "散圖")
+    #         if rel:
+    #             full_path = rel if os.path.isabs(rel) else os.path.join(self.project_root, rel)
+    #             set_(lab_path, full_path)
+    #         else:
+    #             set_(lab_path, "-")
+    #     else:
+    #         set_(lab_origin, "組圖")
+    #         pu = uuid_ 
+    #         if pu:
+    #             mother = self._load_feat(pu) or {}
+    #             w = h = "-"
+    #             for si in (mother.get("sub_images") or []):
+    #                 if si.get("sub_id") == sub_id:
+    #                     x, y, w, h = si.get("bbox", (0, 0, 0, 0))
+    #                     break
+    #             set_(lab_size, f"{w}×{h}")
+    #             rel = mother.get("source_path")
+    #             if rel:
+    #                 full_path = rel if os.path.isabs(rel) else os.path.join(self.project_root, rel)
+    #                 set_(lab_path, full_path)
+    #             else:
+    #                 set_(lab_path, "-")
+    #         else:
+    #             set_(lab_size, "-")
+    #             set_(lab_path, "-")
+
+    #     if group_id:
+    #         grp = next((g for g in (self.groups or []) if g.get("group_id") == group_id), None)
+    #         set_(lab_dups, len(grp.get("members", [])) if grp else "-")
+    #     else:
+    #         set_(lab_dups, "-")
+
+    #     set_(lab_phash, "-")
+
+    # def _on_image_label_clicked(self, meta: dict):
+    #     """處理在橫向群組中圖片縮圖的點擊事件"""
+    #     uuid_  = meta.get("uuid")
+    #     sub_id = meta.get("sub_id") 
+    #     if not uuid_:
+    #         return
+
+    #     if hasattr(self, "group_view") and self.group_view:
+    #         self.group_view.select_member_by_uuid(uuid_, sub_id)
 
     def _on_image_label_clicked(self, meta: dict):
         """處理在橫向群組中圖片縮圖的點擊事件"""
         uuid_  = meta.get("uuid")
         sub_id = meta.get("sub_id") 
+        bbox = meta.get("bbox") # 記得多傳 bbox
         if not uuid_:
             return
 
+        # ★ 修改：不直接呼叫 group_view，而是走統一的非同步載入流程
+        # 我們直接複用 _apply_preview_to_ui 之前的檢查邏輯
+        
+        # 1. 嘗試找母圖 UUID (為了查快取 key)
+        parent_uuid = None
+        feat = self.feature_json_cache.get(uuid_)
+        if feat: parent_uuid = feat.get("parent_uuid")
+        
+        cache_key = parent_uuid if parent_uuid else uuid_
+        
+        # 2. 檢查快取
+        cached_pm = self.mother_pixmap_cache.get(cache_key)
+        
+        if cached_pm and not cached_pm.isNull():
+            # A. 快取有圖 -> 直接顯示 (這是最快路徑)
+            if hasattr(self, "group_view") and self.group_view:
+                self.group_view.select_member_by_uuid(uuid_, sub_id)
+        else:
+            # B. 快取沒圖 -> 啟動背景載入
+            # 這裡我們需要取得檔案路徑
+            rel = feat.get("source_path") if feat else None
+            
+            # 如果是子圖，feat 可能沒路徑，要找母圖
+            if not rel and parent_uuid:
+                 mfeat = self.feature_json_cache.get(parent_uuid)
+                 if not mfeat:
+                     mfeat = self._load_feature_json(parent_uuid)
+                     if mfeat: self.feature_json_cache.put(parent_uuid, mfeat)
+                 if mfeat: rel = mfeat.get("source_path")
+
+            if rel and self.project_root:
+                abs_p = os.path.join(self.project_root, rel)
+                if os.path.exists(abs_p):
+                    # 啟動載入器
+                    self._loading_path = abs_p # 更新當前關注路徑
+                    
+                    # 借用 ImageLoaderRunnable (注意參數順序: path, cache_key, sub_id, bbox)
+                    runnable = ImageLoaderRunnable(abs_p, cache_key, sub_id, bbox)
+                    
+                    # 連接訊號 (載入完後更新 UI)
+                    runnable.signals.loaded.connect(
+                        lambda img, p, k, s, b: self._on_async_image_label_loaded(img, p, k, uuid_, s, b)
+                    )
+                    self._thread_pool.start(runnable)
+
+    def _on_async_image_label_loaded(self, img, path, cache_key, uuid_, sub_id, bbox):
+        """點擊縮圖後的背景載入回調"""
+        if img.isNull():
+            return
+
+        # 存入快取
+        pm = QtGui.QPixmap.fromImage(img)
+        self.mother_pixmap_cache.put(cache_key, pm)
+        
+        # 現在快取有圖了，通知 GroupView 更新
+        # 注意：要確認使用者沒有又點了別張圖 (雖然在 Group 模式下這個檢查比較寬鬆)
         if hasattr(self, "group_view") and self.group_view:
             self.group_view.select_member_by_uuid(uuid_, sub_id)
 
@@ -725,86 +909,254 @@ class MainWindow(QtWidgets.QMainWindow):
                 it.setData(Qt.UserRole, {"uuid": uuid_, "rel": rel})
                 self.list_files.addItem(it)
 
+    # def _on_file_selected(self):
+    #     if self._list_mode != "input":
+    #         return
+
+    #     items = self.list_files.selectedItems()
+    #     if not items:
+    #         if hasattr(self, "group_view"):
+    #             if hasattr(self.group_view, "leftView"):
+    #                 self.group_view.leftView.clear()
+    #             if hasattr(self.group_view, "rightView"):
+    #                 self.group_view.rightView.clear()
+    #             if hasattr(self.group_view, "_update_info_panel"):
+    #                 self.group_view._update_info_panel(None, None, None)
+    #         return
+
+    #     it   = items[0]
+    #     meta = it.data(QtCore.Qt.UserRole) or {}
+    #     uuid_ = meta.get("uuid")
+        
+    #     # ★ 新增：取得列表項目中儲存的相對路徑 (作為備用)
+    #     saved_rel_path = meta.get("rel") 
+
+    #     if not uuid_:
+    #         return
+
+    #     info = {}
+    #     try:
+    #         feat_p = os.path.join(self.project_root, ".image_cache", "features", f"{uuid_}.json")
+    #         if os.path.exists(feat_p):
+    #             with open(feat_p, "r", encoding="utf-8") as f:
+    #                 info = json.load(f)
+    #     except Exception:
+    #         info = {}
+
+    #     dims = (info.get("dimensions") or {})
+    #     w, h = dims.get("width"), dims.get("height")
+
+    #     parent_uuid = info.get("parent_uuid")
+    #     sub_id      = info.get("sub_id")
+    #     rel         = info.get("source_path")
+
+    #     # ★ 新增：如果 JSON 裡讀不到路徑 (代表還沒處理)，就使用列表儲存的路徑
+    #     if not rel and saved_rel_path:
+    #         rel = saved_rel_path
+
+    #     mother = {}
+    #     if parent_uuid:
+    #         try:
+    #             mpath = os.path.join(self.project_root, ".image_cache", "features", f"{parent_uuid}.json")
+    #             if os.path.exists(mpath):
+    #                 with open(mpath, "r", encoding="utf-8") as f:
+    #                     mother = json.load(f)
+    #         except Exception:
+    #             mother = {}
+
+    #         if sub_id is None:
+    #             for si in mother.get("sub_images") or []:
+    #                 if si.get("uuid") == uuid_:
+    #                     sub_id = si.get("sub_id")
+    #                     break
+
+    #         if not rel:
+    #             rel = mother.get("source_path")
+
+    #     if hasattr(self, "group_view") and self.group_view.project_root:
+    #         # 1. 嘗試使用標準邏輯 (若有快取 JSON 則會成功)
+    #         self.group_view._show_member_views(uuid_, sub_id if parent_uuid else None)
+
+    #         # 2. ★ 新增補救邏輯：如果右側視圖是空的 (因為沒有 JSON)，手動載入圖片
+    #         view_is_empty = True
+    #         if self.group_view.rightView.scene() and len(self.group_view.rightView.scene().items()) > 0:
+    #             view_is_empty = False
+            
+    #         if view_is_empty and rel:
+    #             abs_p = os.path.join(self.project_root, rel)
+    #             if os.path.exists(abs_p):
+    #                 pm = QtGui.QPixmap(abs_p)
+    #                 if not pm.isNull():
+    #                     # 強制在右側顯示
+    #                     self.group_view.rightView.show_image(pm, fit=True)
+    #                     # 手動更新一下尺寸資訊
+    #                     w, h = pm.width(), pm.height()
+
+    #         self.group_view._last_selected_meta = {
+    #             "type": "member",
+    #             "uuid": uuid_,
+    #             "sub_id": sub_id if parent_uuid else None,
+    #         }
+
+    #         if hasattr(self.group_view, "select_member_by_uuid"):
+    #             self.group_view.select_member_by_uuid(uuid_, sub_id)
+
+    #         btn = getattr(self.group_view, "btn_open_folder", None)
+    #         if btn:
+    #             btn.setEnabled(bool(rel))
+
+    #     # 更新文字資訊
+    #     img_type = "子圖" if parent_uuid else "散圖"
+    #     if not parent_uuid and not info: img_type = "預覽" # 未處理狀態
+
+    #     self.group_view._update_info_panel(uuid_, sub_id if parent_uuid else None, None)
+        
+    #     # ★ 如果上面的 _update_info_panel 失敗 (因為沒 JSON)，手動補上資訊
+    #     if not info and rel and hasattr(self.group_view, "info_path"):
+    #          self.group_view.info_uuid.setText(uuid_[:8])
+    #          self.group_view.info_size.setText(f"{w}x{h}" if w else "-")
+    #          self.group_view.info_path.setText(rel)
+    #          self.group_view.info_source.setText("尚未處理")
+
     def _on_file_selected(self):
-        if self._list_mode != "input":
-            return
+        # 只要使用者還在操作，就停止計時器並重新倒數
+        self._preview_timer.stop()
+        self._preview_timer.start()
+
+    def _do_load_preview(self):
+        if hasattr(self, "group_view"):
+            self.group_view.attach_caches(self.feature_json_cache, self.mother_pixmap_cache)
 
         items = self.list_files.selectedItems()
-        if not items:
-            if hasattr(self, "group_view"):
-                if hasattr(self.group_view, "leftView"):
-                    self.group_view.leftView.clear()
-                if hasattr(self.group_view, "rightView"):
-                    self.group_view.rightView.clear()
-            self._update_info_panel(None, None, None)
-            return
+        if not items: return
 
-        it   = items[0]
+        it = items[0]
         meta = it.data(QtCore.Qt.UserRole) or {}
         uuid_ = meta.get("uuid")
-        if not uuid_:
-            return
+        sub_id = meta.get("sub_id")
+        saved_rel_path = meta.get("rel") 
 
+        if not uuid_: return
+
+        # 1. 取得路徑與母圖資訊 (保持原樣)
         info = {}
         try:
             feat_p = os.path.join(self.project_root, ".image_cache", "features", f"{uuid_}.json")
             if os.path.exists(feat_p):
                 with open(feat_p, "r", encoding="utf-8") as f:
                     info = json.load(f)
-        except Exception:
-            info = {}
-
-        dims = (info.get("dimensions") or {})
-        w, h = dims.get("width"), dims.get("height")
+        except Exception: pass
 
         parent_uuid = info.get("parent_uuid")
-        sub_id      = info.get("sub_id")
-        rel         = info.get("source_path")
-
-        mother = {}
+        if sub_id is None: sub_id = info.get("sub_id")
+        rel = info.get("source_path") or saved_rel_path
+        
+        bbox = None
         if parent_uuid:
             try:
-                mpath = os.path.join(self.project_root, ".image_cache", "features", f"{parent_uuid}.json")
-                if os.path.exists(mpath):
-                    with open(mpath, "r", encoding="utf-8") as f:
-                        mother = json.load(f)
-            except Exception:
-                mother = {}
+                mp = os.path.join(self.project_root, ".image_cache", "features", f"{parent_uuid}.json")
+                if os.path.exists(mp):
+                    with open(mp, "r", encoding="utf-8") as f:
+                        mother_info = json.load(f)
+                    if not rel: rel = mother_info.get("source_path")
+                    target_sid = str(sub_id) if sub_id is not None else None
+                    if target_sid:
+                        for si in mother_info.get("sub_images") or []:
+                            if str(si.get("sub_id")) == target_sid:
+                                bbox = si.get("bbox"); break
+                    elif uuid_: 
+                         for si in mother_info.get("sub_images") or []:
+                            if si.get("sub_uuid") == uuid_ or si.get("uuid") == uuid_:
+                                bbox = si.get("bbox"); sub_id = si.get("sub_id"); break
+            except: pass
+        
+        cache_key = parent_uuid if parent_uuid else uuid_
 
-            if sub_id is None:
-                for si in mother.get("sub_images") or []:
-                    if si.get("uuid") == uuid_:
-                        sub_id = si.get("sub_id")
-                        break
-
-            if not rel:
-                rel = mother.get("source_path")
-
-        if hasattr(self, "group_view") and self.group_view.project_root:
-            self.group_view._show_member_views(uuid_, sub_id if parent_uuid else None)
-
-            self.group_view._last_selected_meta = {
-                "type": "member",
-                "uuid": uuid_,
-                "sub_id": sub_id if parent_uuid else None,
-            }
-
-            if hasattr(self.group_view, "select_member_by_uuid"):
-                self.group_view.select_member_by_uuid(uuid_, sub_id)
-
-            btn = getattr(self.group_view, "btn_open_folder", None)
-            if btn:
-                btn.setEnabled(bool(rel))
-
-        img_type = "子圖" if parent_uuid else "散圖"
+        # 更新右側文字 (保持原樣)
         self.group_view._update_info_panel(uuid_, sub_id if parent_uuid else None, None)
+        if not info and rel and hasattr(self.group_view, "info_path"):
+             dims = (info.get("dimensions") or {})
+             w, h = dims.get("width"), dims.get("height")
+             self.group_view.info_uuid.setText(uuid_[:8])
+             self.group_view.info_size.setText(f"{w}x{h}" if w else "-")
+             self.group_view.info_path.setText(rel)
+             self.group_view.info_source.setText("尚未處理")
 
-        # if hasattr(self, "group_view"):
-        #     if hasattr(self.group_view, "info_uuid"):   self.group_view.info_uuid.setText(uuid_[:8] if uuid_ else "-")
-        #     if hasattr(self.group_view, "info_subid"):  self.group_view.info_subid.setText(str(sub_id) if sub_id is not None else "-")
-        #     if hasattr(self.group_view, "info_source"): self.group_view.info_source.setText(rel or "-")
-        #     if hasattr(self.group_view, "info_size"):   self.group_view.info_size.setText(f'{w if w else "-"}×{h if h else "-"}')
-        #     if hasattr(self.group_view, "info_path"):   self.group_view.info_path.setText(rel or "-")
+        if not rel:
+            self.group_view.rightView.clear()
+            return
+
+        abs_p = os.path.join(self.project_root, rel)
+        if not os.path.exists(abs_p): return
+
+        # A. 檢查記憶體快取 (命中則直接顯示)
+        cached_pm = self.mother_pixmap_cache.get(cache_key)
+        if cached_pm and not cached_pm.isNull():
+            self._apply_preview_to_ui(cache_key, uuid_, sub_id, bbox, cached_pm)
+            return
+
+        # B. ★ 修改重點：使用 QThreadPool 啟動任務
+        self._loading_path = abs_p
+        
+        # 建立 Runnable 任務
+        runnable = ImageLoaderRunnable(abs_p, cache_key, uuid_, bbox) # 這裡稍微借用 uuid_ 欄位傳 sub_id 需注意參數順序，建議修正如下：
+        runnable = ImageLoaderRunnable(abs_p, cache_key, sub_id, bbox) # 修正參數對應
+        
+        # 連接訊號 (傳遞 uuid_ 給回調以便確認)
+        runnable.signals.loaded.connect(
+            lambda img, p, k, s, b: self._on_async_image_loaded(img, p, k, uuid_, s, b)
+        )
+        
+        # 丟進執行緒池，它會自動排隊，不會一次產生 200 個執行緒
+        self._thread_pool.start(runnable)
+
+    def _cleanup_loader(self, loader):
+        if loader in self._active_loaders:
+            self._active_loaders.remove(loader)
+        loader.deleteLater()
+
+    def _on_async_image_loaded(self, img, path, cache_key, uuid_, sub_id, bbox):
+        """背景讀取完成"""
+        # 檢查是否為當前需要顯示的路徑
+        if path != self._loading_path:
+            return 
+        
+        if img.isNull():
+            return
+
+        # 轉換並存入快取
+        pm = QtGui.QPixmap.fromImage(img)
+        self.mother_pixmap_cache.put(cache_key, pm)
+        
+        # 更新介面
+        self._apply_preview_to_ui(cache_key, uuid_, sub_id, bbox, pm)
+
+    def _apply_preview_to_ui(self, cache_key, uuid_, sub_id, bbox, pm):
+        """統一負責將圖片顯示到畫面上 (依據當前模式)"""
+        
+        # 情況 A：群組模式
+        if self._list_mode == "grouped":
+            if hasattr(self, "group_view") and self.group_view:
+                # ★ 這裡有個技巧：
+                # 因為圖片已經在 mother_pixmap_cache 裡了 (我們剛存進去)
+                # GroupWidget 的 select_member_by_uuid 內部會去 cache.get()
+                # 所以這次呼叫會是 Instant (瞬間) 的，不會觸發 I/O
+                self.group_view.select_member_by_uuid(uuid_, sub_id)
+            return
+
+        # 情況 B：輸入模式 (手動繪製)
+        if not hasattr(self, "group_view"): return
+        self.group_view.rightView.show_image(pm, fit=True)
+        
+        if sub_id is not None and bbox:
+            target_bbox_dict = {"sub_id": str(sub_id), "bbox": bbox}
+            self.group_view.rightView.draw_bboxes([target_bbox_dict])
+            self.group_view.rightView.focus_bbox(str(sub_id))
+        else:
+            self.group_view.rightView.draw_bboxes([])
+            
+        btn = getattr(self.group_view, "btn_open_folder", None)
+        if btn: btn.setEnabled(True)
 
     def features_iter(self):
         """
@@ -1374,8 +1726,23 @@ class MainWindow(QtWidgets.QMainWindow):
                 full_path = rel if os.path.isabs(rel) else os.path.join(self.project_root, rel)
 
             if full_path and os.path.exists(full_path):
-                temp_base = QtGui.QPixmap(full_path)
-                if not temp_base.isNull():
+                # 1. 嘗試從母圖快取讀取 (避免重複讀取大檔)
+                # GroupWidget 使用 uuid 作為 key，這裡保持一致
+                temp_base = self.mother_pixmap_cache.get(uuid_)
+                if temp_base is None:
+                    temp_base = QtGui.QPixmap(full_path)
+                    if not temp_base.isNull():
+                        self.mother_pixmap_cache.put(uuid_, temp_base)
+                
+                if temp_base and not temp_base.isNull():
+                    # 2. ★ 關鍵修正：如果有 bbox，必須進行裁切 ★
+                    if bbox and len(bbox) == 4:
+                        x, y, w, h = map(int, bbox)
+                        rect = QtCore.QRect(x, y, w, h).intersected(temp_base.rect())
+                        if not rect.isEmpty():
+                            temp_base = temp_base.copy(rect)
+                    
+                    # 3. 縮放並存入縮圖快取
                     base_cache_key = (temp_base.cacheKey(), target_size)
                     scaled_base = self.thumb_scaled_base_cache.get(base_cache_key)
 
@@ -1427,32 +1794,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         groups = {}
 
-        # if not getattr(self, "object_groups", None):
-        #     self._build_object_groups()
-        # groups = dict(self.object_groups or {})
-
-        # if not groups:
-        #     try:
-        #         if not getattr(self, "project_root", None):
-        #             raise RuntimeError("project_root is None")
-        #         res_p = os.path.join(self.project_root, ".image_cache", "results.json")
-        #         sim_groups = []
-        #         if os.path.exists(res_p):
-        #             with open(res_p, "r", encoding="utf-8") as f:
-        #                 res = json.load(f)
-        #             sim_groups = res.get("similarity_groups") or []
-        #             if not sim_groups and hasattr(self, "group_view") and hasattr(self.group_view, "_build_groups_from_pairs"):
-        #                 sim_groups = self.group_view._build_groups_from_pairs(res)
-
-        #         for g in sim_groups:
-        #             gname = g.get("group_id") or "pairs"
-        #             for m in (g.get("members") or []):
-        #                 groups.setdefault(gname, []).append({
-        #                     "uuid": m.get("uuid"), "sub_id": m.get("sub_id"), "bbox": m.get("bbox")
-        #                 })
-        #     except Exception as e:
-        #         print(f"[WARN] fallback to similarity_groups failed: {e}")
-
         try:
             if not getattr(self, "project_root", None):
                 raise RuntimeError("project_root is None")
@@ -1461,10 +1802,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if os.path.exists(res_p):
                 with open(res_p, "r", encoding="utf-8") as f:
                     res = json.load(f)
-                
-                # 從 group_widget 獲取分群結果
                 sim_groups = self.group_view.groups 
-                
                 if not sim_groups and hasattr(self.group_view, "_build_groups_from_pairs"):
                     sim_groups = self.group_view._build_groups_from_pairs(res)
 
@@ -1476,17 +1814,13 @@ class MainWindow(QtWidgets.QMainWindow):
                     })
         except Exception as e:
             print(f"[WARN] loading similarity_groups failed: {e}")
-        
+
         if not groups:
             self.list_files.setRowCount(1)
-            no_results_label = QtWidgets.QLabel("尚無分群結果")
-            no_results_label.setAlignment(Qt.AlignCenter)
-            self.list_files.setCellWidget(0, 0, no_results_label)
-            self.list_files.setRowHeight(0, 100)
+            # ... (顯示無結果，保持原樣) ...
             return
 
         self.object_groups = groups
-
         self.list_files.setRowCount(len(groups))
         
         if self.dark_mode:
@@ -1497,10 +1831,12 @@ class MainWindow(QtWidgets.QMainWindow):
         sorted_groups = sorted(groups.items(), key=lambda kv: (-len(kv[1]), kv[0]))
         icon_size = 120
 
+        # ★ 準備預設圖 (避免重複建立物件)
+        placeholder = QtGui.QPixmap(icon_size, icon_size)
+        placeholder.fill(QtCore.Qt.transparent)
+        
+        # 開始建立列表
         for row_index, (gname, members) in enumerate(sorted_groups):
-            if not members:
-                continue
-
             row_widget = QtWidgets.QWidget()
             row_widget.setAutoFillBackground(True)
             palette = row_widget.palette()
@@ -1513,7 +1849,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
             comp_name = f"comp_{row_index + 1}"
             header_label = QtWidgets.QLabel(f"<b>{comp_name}</b><br>({len(members)} 個)")
-            
             header_label.setFixedWidth(160)
             header_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
             row_layout.addWidget(header_label)
@@ -1536,19 +1871,56 @@ class MainWindow(QtWidgets.QMainWindow):
                 sub_id = m.get("sub_id")
                 bbox = m.get("bbox")
                 
-                pm = self._make_thumbnail_with_overlays(uuid_, sub_id, bbox, grouped=False, target_size=icon_size)
-                
+                # 建立 ImageLabel
                 metadata = {"uuid": uuid_, "sub_id": sub_id, "group": comp_name, "bbox": bbox}
-                
                 img_label = ImageLabel(metadata)
                 img_label.setProperty("role", "thumb")
-                img_label.setPixmap(pm)
                 img_label.setFixedSize(icon_size, icon_size)
                 img_label.setAlignment(Qt.AlignCenter)
-                img_label.setToolTip(f"UUID: {uuid_[:8]}\nSub ID: {sub_id}")
-                
                 img_label.clicked.connect(self._on_image_label_clicked)
                 
+                # ★ 關鍵修改：不直接呼叫 _make_thumbnail，而是發起非同步任務
+                
+                # 1. 檢查快取 (如果有縮圖快取，直接顯示，最快)
+                cache_key = (uuid_, sub_id, icon_size) # 簡單的 key
+                # 注意：這裡我們需要一個能存取縮圖的 key，為了簡化，我們先試著查母圖快取
+                # 如果要嚴謹的縮圖快取，可以用 self.thumb_scaled_base_cache
+                # 但這裡為了效能，我們先一律設為 placeholder，然後丟進 thread pool
+                
+                img_label.setPixmap(placeholder) # 先顯示空白
+                
+                # 取得檔案路徑
+                feat = self.feature_json_cache.get(uuid_)
+                if feat is None:
+                    feat = self._load_feature_json(uuid_) or {}
+                    self.feature_json_cache.put(uuid_, feat)
+                
+                rel = feat.get("source_path")
+                full_path = None
+                if self.project_root and rel:
+                    full_path = rel if os.path.isabs(rel) else os.path.join(self.project_root, rel)
+
+                # 2. 啟動背景任務
+                if full_path:
+                    unique_id = f"{uuid_}_{sub_id}_{row_index}"
+                    img_label.setObjectName(unique_id)
+                    
+                    # 1. 建立這個任務專屬的訊號發射器 (WorkerSignals)
+                    task_signal = WorkerSignals()
+                    
+                    # 2. 建立任務，並傳入這個專屬發射器
+                    task = ThumbnailRunnable(
+                        full_path, uuid_, sub_id, bbox, icon_size, task_signal
+                    )
+                    
+                    # 3. ★ 關鍵：使用 lambda 閉包綁定這裡的 img_label
+                    # 這樣當圖片讀好時，程式就知道要把圖貼到哪一個 label 上
+                    task_signal.loaded.connect(
+                        lambda img, p, u, s, b, label=img_label: self._update_list_item_thumb(label, img)
+                    )
+                    
+                    self._thread_pool.start(task)
+
                 image_layout.addWidget(img_label)
 
             scroll_area.setWidget(image_container)
@@ -1558,6 +1930,23 @@ class MainWindow(QtWidgets.QMainWindow):
             self.list_files.setRowHeight(row_index, icon_size + 20)
 
         self.lb_count.setText(f"群組：{len(groups)}")
+
+    def _update_list_item_thumb(self, label, img):
+        """背景縮圖完成後，更新 UI"""
+        try:
+            # 檢查 label 是否還存在 (C++物件可能已刪除)
+            if not label or not label.isVisible():
+                return
+            
+            if img.isNull():
+                return
+
+            pm = QtGui.QPixmap.fromImage(img)
+            label.setPixmap(pm)
+            
+        except RuntimeError:
+            # 這是正常的，當使用者快速清空列表時，widget 可能已被銷毀
+            pass
 
     # def _refresh_file_list_grouped_mode(self):
     #     self._list_mode = "grouped"
@@ -2415,7 +2804,14 @@ class MainWindow(QtWidgets.QMainWindow):
         if not root: return
         self.project_root = root
         os.makedirs(os.path.join(root, ".image_cache"), exist_ok=True)
+
         self.index = IndexStore(root)
+        # ★ 這行是關鍵：先載入舊的 index.json，如果沒有會安靜失敗，不影響第一次使用
+        try:
+            self.index.load()
+        except Exception:
+            pass
+
         self.features = FeatureStore(root)
         self.logger = ActionsLogger(root)
         self.logger.append("scan_started", {"project_root": root}, {"include_exts": list(self._image_exts())})
@@ -2445,6 +2841,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.index.save()
         self.logger.append("scan_finished", {"project_root": root}, {"new_or_touched": added, "errors": errors})
         
+        self._refresh_file_list_input_mode()
+
+        if added or errors:
+            msg = f"從資料夾加入 {added} 張圖片"
+            if errors:
+                msg += f"（失敗 {errors}）"
+            self.sb_text.setText(msg)
+        else:
+            self.sb_text.setText("資料夾內未找到可用圖片")
+
         self._refresh_file_list_input_mode()
 
         if added or errors:
@@ -2504,7 +2910,14 @@ class MainWindow(QtWidgets.QMainWindow):
             root = os.path.dirname(files[0])
             self.project_root = root
             os.makedirs(os.path.join(root, ".image_cache"), exist_ok=True)
+
             self.index = IndexStore(root)
+            # ★ 同樣先嘗試載入舊的 index.json
+            try:
+                self.index.load()
+            except Exception:
+                pass
+
             self.features = FeatureStore(root)
             self.logger = ActionsLogger(root)
             self.logger.append("scan_started", {"project_root": root}, {"include_exts": list(self._image_exts())})
@@ -2533,6 +2946,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_file_list_input_mode()
         if added:
             self.sb_text.setText(f"新增 {added} 張圖片")
+
+        self._refresh_file_list_input_mode()
+        if added:
+            self.sb_text.setText(f"新增 {added} 張圖片")
+
 
     # def on_add(self):
     #     files, _ = QtWidgets.QFileDialog.getOpenFileNames(
@@ -2573,6 +2991,7 @@ class MainWindow(QtWidgets.QMainWindow):
     #         self.sb_text.setText(f"新增 {added} 張圖片")
 
     def on_clear(self):
+        # 1. 清理主視窗的資料結構
         self.items_raw.clear()
         self.pool.clear()
         self.id2item.clear()
@@ -2582,24 +3001,45 @@ class MainWindow(QtWidgets.QMainWindow):
         self._input_order.clear()
         self._input_paths.clear()
 
-        self.feature_json_cache = LRUCache(capacity=100)
+        # 2. 清理快取
+        # 注意：雖然清空了，但為了避免記憶體洩漏，建議重置為新的空快取物件
+        self.feature_json_cache = LRUCache(capacity=5000)
         self.mother_pixmap_cache = LRUCache(capacity=50)
-        self.thumb_scaled_base_cache = LRUCache(capacity=50)
+        self.thumb_scaled_base_cache = LRUCache(capacity=500)
 
+        # 3. 清理左側列表
         self.list_files.clear()
         self.list_files.setRowCount(0)
         self.lb_count.setText("已加入：0")
         self.lb_pairs.setText("相似結果：0 組")
         self.sb_text.setText("已清空")
 
+        # 4. ★ 關鍵修改：徹底重置 GroupResultsWidget 的狀態 ★
         if hasattr(self, "group_view"):
             try:
+                # 清除介面
                 self.group_view.tree.clear()
                 self.group_view.leftView.clear()
                 self.group_view.rightView.clear()
+                
+                # 清除內部狀態 (這一步最重要！)
+                self.group_view.member_item_map.clear()
+                self.group_view.group_id_map.clear()
+                self.group_view.group_pairs_map.clear()
+                self.group_view.groups = []
+                self.group_view.current_uuid = None
+                if hasattr(self.group_view, "_last_selected_meta"):
+                    self.group_view._last_selected_meta = None
+                
+                # 更新資訊面板為空
                 self.group_view._update_info_panel(None, None, None)
-            except Exception:
-                pass
+                
+                # 重新綁定新的快取物件給 GroupWidget
+                # 因為上面步驟 2 我們換了新的 cache 物件，GroupWidget 手上拿的可能是舊的
+                self.group_view.attach_caches(self.feature_json_cache, self.mother_pixmap_cache)
+                
+            except Exception as e:
+                print(f"[Warn] Error clearing group_view: {e}")
 
         self.progress.setRange(0, 0) 
         self.progress.setValue(0)
@@ -2654,6 +3094,28 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self._input_order:
             QtWidgets.QMessageBox.information(self, "提示", "請先新增圖片。")
             return
+        
+        if self.project_root:
+            cache_results = os.path.join(self.project_root, ".image_cache", "results.json")
+            if os.path.exists(cache_results):
+                print("[Info] Found cached results, loading directly...")
+                self.sb_text.setText("正在讀取快取結果...")
+                
+                # 1. 載入資料
+                self.group_view.load_from_results()
+                
+                # 2. 切換介面模式
+                self._refresh_file_list_grouped_mode()
+                
+                # 3. 更新狀態顯示 (模擬掃描完成的狀態)
+                self.progress.setValue(100)
+                group_count = len(self.group_view.groups) if self.group_view.groups else 0
+                pair_count = len(self.group_view.results.get('pairs', [])) if self.group_view.results else 0
+                self.lb_pairs.setText(f"相似結果：{pair_count} 組")
+                self.sb_text.setText(f"已讀取快取結果 ({group_count} 群)")
+                
+                # 直接返回，不啟動 Worker
+                return
         
         try:
             self.act_run.setEnabled(False)
@@ -2725,6 +3187,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self.sb_text.setText(f"處理失敗: {results['error']}")
             QtWidgets.QMessageBox.critical(self, "處理失敗", results['error'])
             return
+        
+        if getattr(self, "project_root", None):
+            try:
+                self.index = IndexStore(self.project_root)
+                print("[Info] IndexStore reloaded to sync cache status.")
+            except Exception as e:
+                print(f"[Warn] Failed to reload IndexStore: {e}")
 
         self.pairs = results.get("pairs", [])
         self.id2item = results.get("id2item", {})
@@ -2733,25 +3202,30 @@ class MainWindow(QtWidgets.QMainWindow):
         self.in_pair_ids = results.get("in_pair_ids", set())
         self.seen_pair_keys = results.get("seen_pair_keys", set())
 
-        # self.thumb_json_cache.clear()
-        # self.thumb_pixmap_cache.clear()
-        # self.thumb_scaled_base_cache = LRUCache(capacity=50)
+        # ★ 修改 1: 不要重新建立 LRUCache，而是清空並沿用現有的物件
+        # 這樣 GroupWidget 參照到的物件就不會失效
+        if self.feature_json_cache is None:
+            self.feature_json_cache = LRUCache(capacity=5000)
+        
+        if self.mother_pixmap_cache is None:
+            self.mother_pixmap_cache = LRUCache(capacity=50)
+            
+        if self.thumb_scaled_base_cache is None:
+            self.thumb_scaled_base_cache = LRUCache(capacity=500)
 
-        # self.all_json_payloads = results.get("json_payloads", {})
-
-        # if self.all_json_payloads:
-        #     for uuid_, payload in self.all_json_payloads.items():
-        #         self.thumb_json_cache[uuid_] = payload
-
-        self.feature_json_cache = LRUCache(capacity=100)
-        self.mother_pixmap_cache = LRUCache(capacity=50)
-        self.thumb_scaled_base_cache = LRUCache(capacity=50)
+        # 這裡不需要 .clear()，因為增量更新可以保留舊的快取，效能更好。
+        # 如果您堅持要清空，請用 .cache.clear() (假設您的 LRUCache 有實作，或直接操作內部 dict)
+        # self.feature_json_cache.cache.clear() 
 
         self.all_json_payloads = results.get("json_payloads", {})
 
         if self.all_json_payloads:
             for uuid_, payload in self.all_json_payloads.items():
                 self.feature_json_cache.put(uuid_, payload)
+
+        # ★ 修改 2: 再次呼叫 attach_caches 確保 GroupWidget 拿到的是最新的 (雙重保險)
+        if hasattr(self, "group_view"):
+            self.group_view.attach_caches(self.feature_json_cache, self.mother_pixmap_cache)
 
         if getattr(self, "project_root", None):
             try:

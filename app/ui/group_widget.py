@@ -712,32 +712,36 @@ class GroupResultsWidget(QtWidgets.QWidget):
     #     return pm if not pm.isNull() else None
 
     def _mother_pixmap(self, parent_uuid: str) -> QtGui.QPixmap | None:
-        cached_pm = self.mother_pixmap_cache.get(parent_uuid)
-        if cached_pm is not None:
-            return cached_pm
-
-        mf = self._load_feat(parent_uuid)
-        if not mf or not mf.get("source_path") or not self.project_root:
+        if self.mother_pixmap_cache is None:
             return None
+            
+        return self.mother_pixmap_cache.get(parent_uuid)
+        # cached_pm = self.mother_pixmap_cache.get(parent_uuid)
+        # if cached_pm is not None:
+        #     return cached_pm
+
+        # mf = self._load_feat(parent_uuid)
+        # if not mf or not mf.get("source_path") or not self.project_root:
+        #     return None
         
-        p = os.path.join(self.project_root, mf["source_path"])
-        if not os.path.exists(p):
-            return None
+        # p = os.path.join(self.project_root, mf["source_path"])
+        # if not os.path.exists(p):
+        #     return None
             
-        pm = QtGui.QPixmap(p)
+        # pm = QtGui.QPixmap(p)
 
-        if pm.isNull():
-            return None
+        # if pm.isNull():
+        #     return None
             
-        MAX_SIZE = 2048
-        if pm.width() > MAX_SIZE or pm.height() > MAX_SIZE:
-            pm = pm.scaled(
-                MAX_SIZE, MAX_SIZE,
-                QtCore.Qt.KeepAspectRatio,
-                QtCore.Qt.SmoothTransformation
-            )
-        self.mother_pixmap_cache.put(parent_uuid, pm)
-        return pm
+        # MAX_SIZE = 2048
+        # if pm.width() > MAX_SIZE or pm.height() > MAX_SIZE:
+        #     pm = pm.scaled(
+        #         MAX_SIZE, MAX_SIZE,
+        #         QtCore.Qt.KeepAspectRatio,
+        #         QtCore.Qt.SmoothTransformation
+        #     )
+        # self.mother_pixmap_cache.put(parent_uuid, pm)
+        # return pm
 
     def _crop_from_sheet(self, parent_uuid: str, bbox) -> QtGui.QPixmap | None:
         pm = self._mother_pixmap(parent_uuid)
@@ -792,18 +796,16 @@ class GroupResultsWidget(QtWidgets.QWidget):
         
         feat = self._load_feat(uuid_) or {}
         rel = feat.get("source_path")
-        if rel and self.project_root:
-            abs_p = os.path.join(self.project_root, rel)
-            
+        
+        if rel and self.project_root and self.mother_pixmap_cache:
+            # 只從快取拿，絕對不 new QPixmap
             pm = self.mother_pixmap_cache.get(uuid_)
-            if pm is None:
-                if os.path.exists(abs_p):
-                    pm = QtGui.QPixmap(abs_p)
-                    if not pm.isNull():
-                        self.mother_pixmap_cache.put(uuid_, pm)
-
             if pm and not pm.isNull():
                 self.rightView.show_image(pm, fit=True)
+            else:
+                # 快取沒圖：這裡不該讀取，而是應該顯示空白或載入中
+                # 真正的讀取會由 MainWindow 的非同步機制觸發
+                self.rightView.clear()
         
         self._update_info_panel(uuid_, None, gid)
         if hasattr(self, "btn_open_folder"):
