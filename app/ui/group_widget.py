@@ -81,6 +81,7 @@ class GroupResultsWidget(QtWidgets.QWidget):
 
     def __init__(self, main_window, use_external_info_panel=True, parent=None):
         super().__init__(parent)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Ignored)
         self.main = main_window
         self.project_root = None
         self.results = None
@@ -98,6 +99,9 @@ class GroupResultsWidget(QtWidgets.QWidget):
 
         self.leftView  = BBoxGraphicsView(self)
         self.rightView = BBoxGraphicsView(self)
+
+        self.leftView.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Ignored)
+        self.rightView.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Ignored)
 
         self.leftView.auto_key_white = False
         self.rightView.auto_key_white = False

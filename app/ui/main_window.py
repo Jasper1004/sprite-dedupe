@@ -108,23 +108,24 @@ class ThumbnailRunnable(QtCore.QRunnable):
             return
 
         reader = QtGui.QImageReader(self.path)
-        img = None
         
-        # 1. 策略分流
+        # 1. 策略分流：根據是否有 bbox 決定讀取方式
         if self.bbox and len(self.bbox) == 4:
-            # --- 情況 A：讀取子圖 ---
+            # --- 情況 A：讀取子圖 (Sprite) ---
+            # 使用 setClipRect 只讀取局部區域，這樣可以保留該區域的原始解析度
+            # 也不會因為母圖很大而消耗過多記憶體
             x, y, w, h = map(int, self.bbox)
             reader.setClipRect(QtCore.QRect(x, y, w, h))
             img = reader.read()
         else:
-            # --- 情況 B：讀取整張圖 ---
-            # 讀取時先做一次粗略縮小，避免讀入巨型圖檔
+            # --- 情況 B：讀取整張圖 (Single Image) ---
+            # 如果是單張大圖，我們依然需要防止讀入幾千萬畫素的大檔
+            # 所以這裡維持原本的「讀取時縮小」優化
             orig_size = reader.size()
             if not orig_size.isValid():
                 return
 
-            # 預讀取稍微大一點，保留畫質
-            scale_target = self.target_size * 2 
+            scale_target = self.target_size * 2 # 預讀取大一點點，保持畫質
             
             if orig_size.width() > scale_target or orig_size.height() > scale_target:
                 scale_ratio = min(scale_target / orig_size.width(), scale_target / orig_size.height())
@@ -134,24 +135,17 @@ class ThumbnailRunnable(QtCore.QRunnable):
             
             img = reader.read()
 
-        if img is None or img.isNull():
+        if img.isNull():
             return
-
-        # 2. 統一縮放至目標大小
+        
         if img.width() != self.target_size and img.height() != self.target_size:
-            # ★ 優化：智慧選擇縮放演算法
-            # 如果圖片還是很大 (例如子圖很大)，使用 FastTransformation 避免 CPU 飆高
-            # 如果圖片已經很小，使用 SmoothTransformation 保持品質
-            mode = QtCore.Qt.SmoothTransformation
-            if img.width() > 1000 or img.height() > 1000:
-                mode = QtCore.Qt.FastTransformation
-                
             img = img.scaled(
                 self.target_size, self.target_size,
                 QtCore.Qt.KeepAspectRatio,
-                mode
+                QtCore.Qt.SmoothTransformation
             )
             
+        # 3. 回傳結果
         self.emitter.loaded.emit(img, self.path, self.uuid, self.sub_id, self.bbox)
 
 class WorkerSignals(QtCore.QObject):
@@ -170,31 +164,12 @@ class ImageLoaderRunnable(QtCore.QRunnable):
 
     @QtCore.pyqtSlot()
     def run(self):
-        if not self.path or not os.path.exists(self.path):
-            self.signals.loaded.emit(QtGui.QImage(), self.path, self.cache_key, self.sub_id, self.bbox)
-            return
-
-        reader = QtGui.QImageReader(self.path)
-        
-        # 1. 針對「子圖 (Sub-image)」的優化：只讀取裁切區域
-        # 這是解決光暈圖卡死的關鍵！如果光暈只是大圖的一小部分，我們只讀那一小塊。
-        if self.sub_id is not None and self.bbox and len(self.bbox) == 4:
-            x, y, w, h = map(int, self.bbox)
-            reader.setClipRect(QtCore.QRect(x, y, w, h))
-            img = reader.read()
+        if self.path and os.path.exists(self.path):
+            img = QtGui.QImage(self.path)
+            # 任務完成，發送訊號
             self.signals.loaded.emit(img, self.path, self.cache_key, self.sub_id, self.bbox)
-            return
-
-        # 2. 針對「整張大圖」的優化：限制最大解析度
-        PREVIEW_MAX_SIZE = 1800 
-        
-        orig_size = reader.size()
-        if orig_size.isValid():
-            if orig_size.width() > PREVIEW_MAX_SIZE or orig_size.height() > PREVIEW_MAX_SIZE:
-                reader.setScaledSize(orig_size.scaled(PREVIEW_MAX_SIZE, PREVIEW_MAX_SIZE, QtCore.Qt.KeepAspectRatio))
-
-        img = reader.read()
-        self.signals.loaded.emit(img, self.path, self.cache_key, self.sub_id, self.bbox)
+        else:
+            self.signals.loaded.emit(QtGui.QImage(), self.path, self.cache_key, self.sub_id, self.bbox)
 
 class LRUCache:
     """LRU 快取"""
@@ -270,13 +245,16 @@ class ScanWorker(QtCore.QObject):
         index_store.load()
 
         try:
-            self.logMessage.emit("步驟 1/4: 讀取圖片...")
-            total = len(input_order)
-            if total == 0:
+            total_input = len(input_order)
+            if total_input == 0:
                 self.finished.emit({"error": "No images to process."})
                 return
-                
-            steps_read = total
+            
+            current_done = 0
+            estimated_initial_steps = total_input * 2
+            self.progressInit.emit(0, estimated_initial_steps)
+
+            self.logMessage.emit("步驟 1/4: 讀取圖片...")
             for idx, (uid, p) in enumerate(input_order):
                 if self._abort: return
                 try:
@@ -288,8 +266,10 @@ class ScanWorker(QtCore.QObject):
                 except Exception as e:
                     self.logMessage.emit(f"[錯誤] 讀取 {p} 失敗: {e}")
 
+                current_done += 1
+                self.progressStep.emit(current_done)
+
             self.logMessage.emit("步驟 2/4: 偵測並切割 Spritesheet...")
-            steps_alpha = len(local_items_raw)
             for idx, it in enumerate(local_items_raw, 1):
                 if self._abort: return
                 boxes_strict = alpha_cc_boxes(it.rgba, alpha_thr, min_area, min_size)
@@ -321,12 +301,21 @@ class ScanWorker(QtCore.QObject):
                     it.rgba = trim_and_pad_rgba(it.rgba, pad=0)
                     local_pool.append(it); local_id2item[it.id] = it
 
+                current_done += 1
+                self.progressStep.emit(current_done)
+
             self.logMessage.emit("步驟 3/4: 提取影像特徵...")
+
+            steps_read = total_input
+            steps_alpha = len(local_items_raw)
+
             N = len(local_pool)
             steps_feat = N
             steps_pairs = (N * (N - 1)) // 2
             total_steps = steps_read + steps_alpha + steps_feat + steps_pairs
             self.progressInit.emit(0, total_steps if total_steps > 0 else 1)
+
+            self.progressStep.emit(current_done)
             
             done = steps_read + steps_alpha
             self.progressStep.emit(done)
@@ -381,8 +370,8 @@ class ScanWorker(QtCore.QObject):
                     area_map[it.id]  = content_area_ratio(it.rgba, alpha_thr)
                     hgram_map[it.id] = gray_hist32(it.rgba, alpha_thr)
                 
-                done += 1
-                self.progressStep.emit(done)
+                current_done += 1
+                self.progressStep.emit(current_done)
             
             temp_id_map = {i.id: i for i in local_pool}
             for item in temp_id_map.values():
@@ -455,9 +444,9 @@ class ScanWorker(QtCore.QObject):
                     
                 for j in range(i + 1, N):
                     
-                    done += 1
-                    if done % 1000 == 0:
-                        self.progressStep.emit(done)
+                    current_done += 1
+                    if current_done % 100 == 0:
+                        self.progressStep.emit(current_done)
                     
                     A, B = local_pool[i], local_pool[j]
                     aid, bid = A.id, B.id
@@ -579,13 +568,11 @@ class ScanWorker(QtCore.QObject):
                     # local_in_pair_ids.update([aid, bid])
                     # local_pairs.append(PairHit(aid, bid, best))
 
-            self.progressStep.emit(done)
+            self.progressStep.emit(current_done)
 
             self.logMessage.emit("正在寫入結果...")
             if project_root:
                 write_results(project_root, local_pairs, local_id2item)
-            
-            self.progressStep.emit(total_steps)
 
             results = {
                 "error": None,
@@ -1024,9 +1011,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._preview_timer.start()
 
     def _do_load_preview(self):
-        if hasattr(self, "group_view"):
-            self.group_view.attach_caches(self.feature_json_cache, self.mother_pixmap_cache)
-
         items = self.list_files.selectedItems()
         if not items: return
 
@@ -3001,6 +2985,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._input_order.clear()
         self._input_paths.clear()
 
+        self._list_mode = "input"
+
         # 2. 清理快取
         # 注意：雖然清空了，但為了避免記憶體洩漏，建議重置為新的空快取物件
         self.feature_json_cache = LRUCache(capacity=5000)
@@ -3191,6 +3177,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if getattr(self, "project_root", None):
             try:
                 self.index = IndexStore(self.project_root)
+                # IndexStore __init__ 會自動 load()，所以這樣就同步了
                 print("[Info] IndexStore reloaded to sync cache status.")
             except Exception as e:
                 print(f"[Warn] Failed to reload IndexStore: {e}")
@@ -3202,30 +3189,28 @@ class MainWindow(QtWidgets.QMainWindow):
         self.in_pair_ids = results.get("in_pair_ids", set())
         self.seen_pair_keys = results.get("seen_pair_keys", set())
 
-        # ★ 修改 1: 不要重新建立 LRUCache，而是清空並沿用現有的物件
-        # 這樣 GroupWidget 參照到的物件就不會失效
-        if self.feature_json_cache is None:
-            self.feature_json_cache = LRUCache(capacity=5000)
-        
-        if self.mother_pixmap_cache is None:
-            self.mother_pixmap_cache = LRUCache(capacity=50)
-            
-        if self.thumb_scaled_base_cache is None:
-            self.thumb_scaled_base_cache = LRUCache(capacity=500)
+        # self.thumb_json_cache.clear()
+        # self.thumb_pixmap_cache.clear()
+        # self.thumb_scaled_base_cache = LRUCache(capacity=50)
 
-        # 這裡不需要 .clear()，因為增量更新可以保留舊的快取，效能更好。
-        # 如果您堅持要清空，請用 .cache.clear() (假設您的 LRUCache 有實作，或直接操作內部 dict)
-        # self.feature_json_cache.cache.clear() 
+        # self.all_json_payloads = results.get("json_payloads", {})
+
+        # if self.all_json_payloads:
+        #     for uuid_, payload in self.all_json_payloads.items():
+        #         self.thumb_json_cache[uuid_] = payload
+
+        self.feature_json_cache = LRUCache(capacity=5000)
+        self.mother_pixmap_cache = LRUCache(capacity=50)
+        self.thumb_scaled_base_cache = LRUCache(capacity=500)
+
+        if hasattr(self, "group_view"):
+            self.group_view.attach_caches(self.feature_json_cache, self.mother_pixmap_cache)
 
         self.all_json_payloads = results.get("json_payloads", {})
 
         if self.all_json_payloads:
             for uuid_, payload in self.all_json_payloads.items():
                 self.feature_json_cache.put(uuid_, payload)
-
-        # ★ 修改 2: 再次呼叫 attach_caches 確保 GroupWidget 拿到的是最新的 (雙重保險)
-        if hasattr(self, "group_view"):
-            self.group_view.attach_caches(self.feature_json_cache, self.mother_pixmap_cache)
 
         if getattr(self, "project_root", None):
             try:
