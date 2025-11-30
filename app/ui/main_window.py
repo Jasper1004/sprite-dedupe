@@ -437,7 +437,7 @@ class ScanWorker(QtCore.QObject):
                 except Exception:
                     pass
 
-            self.logMessage.emit("步驟 4/4: 執行相似度比對 (增量模式)...")
+            self.logMessage.emit("步驟 4/4: 執行相似度比對...")
             
             for i in range(N):
                 if self._abort: return
@@ -690,6 +690,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._thread_pool = QtCore.QThreadPool()
         self._thread_pool.setMaxThreadCount(4)
+
+        QtWidgets.QApplication.instance().installEventFilter(self)
+        self.setAcceptDrops(True)
 
 
     # def _update_info_panel(self, uuid_: str | None, sub_id: int | None, group_id: str | None):
@@ -2342,9 +2345,10 @@ class MainWindow(QtWidgets.QMainWindow):
         child.setData(0, Qt.UserRole, {"left": A.id, "right": B.id, "hamming": ham})
 
     def _build_toolbar(self):
-        tb = QtWidgets.QToolBar()
-        tb.setMovable(False)
-        self.addToolBar(Qt.TopToolBarArea, tb)
+        self.toolbar = QtWidgets.QToolBar()
+        self.toolbar.setMovable(False)
+        self.toolbar.setMouseTracking(True)
+        self.addToolBar(Qt.TopToolBarArea, self.toolbar)
 
         self.act_add = QtWidgets.QAction(QtGui.QIcon.fromTheme("list-add"), "新增圖片", self)
 
@@ -2359,7 +2363,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.act_theme.setCheckable(True)
 
         for a in (self.act_add, self.act_add_dir, self.act_clear, self.act_theme, self.act_params, self.act_run):
-            tb.addAction(a)
+            self.toolbar.addAction(a)
 
         self.act_add.triggered.connect(self.on_add)
         self.act_add_dir.triggered.connect(self.on_add_dir)
@@ -2395,6 +2399,52 @@ class MainWindow(QtWidgets.QMainWindow):
         self.act_add.setShortcut("Ctrl+O")
         self.act_run.setShortcut("Ctrl+R")
         self.act_clear.setShortcut("Ctrl+Backspace")
+
+    def eventFilter(self, obj, event):
+        # 1. 處理滑鼠點擊 (跳出警告視窗)
+        if event.type() == QtCore.QEvent.MouseButtonPress:
+            # 檢查 obj 是否為我們的按鈕 widget
+            # 因為 Action 本身不是 Widget，我們透過 toolbar.widgetForAction() 來比對
+            
+            # 取得各個 Action 對應的 Widget
+            btn_add = self.toolbar.widgetForAction(self.act_add)
+            btn_dir = self.toolbar.widgetForAction(self.act_add_dir)
+            btn_run = self.toolbar.widgetForAction(self.act_run)
+            
+            # 檢查點擊的對象是否為這些按鈕之一，且處於禁用狀態
+            if obj in (btn_add, btn_dir, btn_run) and not obj.isEnabled():
+                QtWidgets.QMessageBox.warning(
+                    self, 
+                    "功能已鎖定", 
+                    "系統正在處理中，或已有處理結果。\n\n請先點擊上方工具列的「清空」按鈕移除目前結果，才能執行新的任務。"
+                )
+                return True # 攔截事件
+
+        # 2. 處理滑鼠移動 (即時 ToolTip)
+        elif event.type() == QtCore.QEvent.MouseMove:
+            # 如果滑鼠在 Toolbar 範圍內移動
+            if obj == self.toolbar:
+                action = self.toolbar.actionAt(event.pos())
+                if action and not action.isEnabled():
+                    if action != self._last_hovered_action:
+                        QtWidgets.QToolTip.showText(QtGui.QCursor.pos(), action.toolTip(), self.toolbar)
+                        self._last_hovered_action = action
+                else:
+                    self._last_hovered_action = None
+        
+        return super().eventFilter(obj, event)
+
+    def _highlight_clear_button(self):
+        """讓清空按鈕高亮一下，提示使用者按這裡"""
+        # 取得清空按鈕的 widget
+        btn_widget = self.toolbar.widgetForAction(self.act_clear)
+        if btn_widget:
+            # 暫時改變樣式
+            orig_style = btn_widget.styleSheet()
+            btn_widget.setStyleSheet("background-color: #ffcccc; border: 2px solid red; border-radius: 4px;")
+            
+            # 500毫秒後恢復原狀
+            QtCore.QTimer.singleShot(500, lambda: btn_widget.setStyleSheet(orig_style))
 
     def _build_central(self):
         central = QtWidgets.QWidget()
@@ -3035,6 +3085,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.act_add_dir.setEnabled(True)
         self.act_clear.setEnabled(True)
 
+        self.act_add.setToolTip("新增圖片")
+        self.act_add_dir.setToolTip("新增資料夾")
+        self.act_run.setToolTip("開始處理")
+        self.act_clear.setToolTip("清空")
+
     def on_params(self):
         dlg = QtWidgets.QDialog(self)
         dlg.setWindowTitle("參數設定")
@@ -3099,6 +3154,17 @@ class MainWindow(QtWidgets.QMainWindow):
                 pair_count = len(self.group_view.results.get('pairs', [])) if self.group_view.results else 0
                 self.lb_pairs.setText(f"相似結果：{pair_count} 組")
                 self.sb_text.setText(f"已讀取快取結果 ({group_count} 群)")
+
+                self.act_run.setEnabled(False)
+                self.act_add.setEnabled(False)
+                self.act_add_dir.setEnabled(False)
+                self.act_clear.setEnabled(True)
+
+                locked_tip = "功能已鎖定：請先按「清空」移除目前結果"
+                self.act_add.setToolTip(locked_tip)
+                self.act_add_dir.setToolTip(locked_tip)
+                self.act_run.setToolTip(locked_tip)
+                self.act_clear.setToolTip("清空")
                 
                 # 直接返回，不啟動 Worker
                 return
@@ -3108,6 +3174,12 @@ class MainWindow(QtWidgets.QMainWindow):
             self.act_add.setEnabled(False)
             self.act_add_dir.setEnabled(False)
             self.act_clear.setEnabled(False)
+            
+            processing_tip = "⚠️ 系統正在處理中，請稍候..."
+            self.act_add.setToolTip(processing_tip)
+            self.act_add_dir.setToolTip(processing_tip)
+            self.act_run.setToolTip(processing_tip)
+            self.act_clear.setToolTip(processing_tip)
         except Exception:
             print("Warning: Cound not find act_run to disable.")
             
@@ -3159,6 +3231,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self.act_add.setEnabled(False)
             self.act_add_dir.setEnabled(False)
             self.act_clear.setEnabled(True)
+
+            locked_tip = "功能已鎖定：請先按「清空」移除目前結果"
+            self.act_add.setToolTip(locked_tip)
+            self.act_add_dir.setToolTip(locked_tip)
+            self.act_run.setToolTip(locked_tip)
         except Exception:
             print("Warning: Could not find act_run to enable.")
 
@@ -3337,7 +3414,103 @@ class MainWindow(QtWidgets.QMainWindow):
         
         QtWidgets.QMessageBox.information(self, "匯出完成", f"已匯出 {exported} 個檔案到：\n{out_dir}")
 
+    def dragEnterEvent(self, event):
+        """當檔案拖入視窗時觸發"""
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):
+        """當檔案在視窗中放開時觸發"""
+        # 1. 首先檢查系統狀態 (是否鎖定)
+        if not self.act_add.isEnabled():
+            # 讓清空按鈕閃爍，提示使用者
+            if self.act_clear.isEnabled():
+                self._highlight_clear_button()
+            
+            # 跳出警告視窗
+            QtWidgets.QMessageBox.warning(
+                self, 
+                "功能已鎖定", 
+                "系統正在處理中，或已有處理結果。\n\n請先點擊上方工具列的「清空」按鈕移除目前結果，才能拖入新的檔案。"
+            )
+            return
+
+        # 2. 開始處理拖入的檔案
+        urls = event.mimeData().urls()
+        if not urls:
+            return
+
+        # 若專案尚未初始化，以第一個拖入項目的路徑作為基準進行初始化
+        if not self.project_root:
+            first_path = urls[0].toLocalFile()
+            if os.path.isfile(first_path):
+                root = os.path.dirname(first_path)
+            else:
+                root = first_path
+            
+            self.project_root = root
+            os.makedirs(os.path.join(root, ".image_cache"), exist_ok=True)
+            self.index = IndexStore(root)
+            try: self.index.load()
+            except: pass
+            self.features = FeatureStore(root)
+            self.logger = ActionsLogger(root)
+            self.logger.append("scan_started", {"project_root": root}, {"mode": "drag_drop"})
+            self.group_view.set_project_root(self.project_root)
+
+        added = 0
+        errors = 0
+        exts = self._image_exts()
+
+        for url in urls:
+            path = url.toLocalFile()
+            
+            # 如果是資料夾：遞迴掃描
+            if os.path.isdir(path):
+                for root_dir, _, filenames in os.walk(path):
+                    for fn in filenames:
+                        if os.path.splitext(fn)[1].lower() in exts:
+                            abs_p = os.path.join(root_dir, fn)
+                            if abs_p in self._input_paths: continue
+                            try:
+                                uid = self.index.touch_file(abs_p) if self.index else str(uuid.uuid4())
+                                self._input_paths.add(abs_p)
+                                self._input_order.append((uid, abs_p))
+                                added += 1
+                            except:
+                                errors += 1
+            
+            # 如果是檔案：直接加入
+            elif os.path.isfile(path):
+                if os.path.splitext(path)[1].lower() in exts:
+                    abs_p = os.path.abspath(path)
+                    if abs_p in self._input_paths: continue
+                    try:
+                        uid = self.index.touch_file(abs_p) if self.index else str(uuid.uuid4())
+                        self._input_paths.add(abs_p)
+                        self._input_order.append((uid, abs_p))
+                        added += 1
+                    except:
+                        errors += 1
+
+        if self.index:
+            self.index.save()
+
+        self._refresh_file_list_input_mode()
+        
+        status_msg = ""
+        if added:
+            status_msg = f"透過拖放新增 {added} 張圖片"
+        if errors:
+            status_msg += f" (失敗 {errors})"
+        
+        if status_msg:
+            self.sb_text.setText(status_msg)
+
     def closeEvent(self, e: QtGui.QCloseEvent):
+        QtWidgets.QApplication.instance().removeEventFilter(self)
         try:
             shutil.rmtree(self.temp_dir, ignore_errors=True)
         except Exception:

@@ -1106,6 +1106,49 @@ class GroupResultsWidget(QtWidgets.QWidget):
             pass
 
 
+    # def _build_info_panel(self) -> QtWidgets.QWidget:
+    #     """右側資訊面板：不依賴 MainWindow 的 splitter_right，直接在本 widget 內建立。"""
+    #     panel = QtWidgets.QWidget(self)
+
+    #     outer = QtWidgets.QVBoxLayout(panel)
+    #     outer.setContentsMargins(8, 8, 8, 8)
+    #     outer.setSpacing(6)
+
+    #     form  = QtWidgets.QFormLayout()
+    #     form.setContentsMargins(0, 0, 0, 0)
+    #     form.setSpacing(6)
+
+    #     self.info_uuid   = QtWidgets.QLabel("-")
+    #     self.info_subid  = QtWidgets.QLabel("-")
+    #     self.info_size   = QtWidgets.QLabel("-")
+    #     self.info_source = QtWidgets.QLabel("-")
+    #     self.info_path   = QtWidgets.QLabel("-")
+    #     self.info_count  = QtWidgets.QLabel("-")
+        
+    #     form.addRow("UUID：",       self.info_uuid)
+    #     form.addRow("子圖ID：",     self.info_subid)
+    #     form.addRow("尺寸：",       self.info_size)
+    #     form.addRow("來源：",       self.info_source)
+    #     form.addRow("路徑：",       self.info_path)
+    #     form.addRow("同群數量：",    self.info_count)
+        
+    #     outer.addLayout(form)
+    #     outer.addStretch(1)
+
+    #     row = QtWidgets.QHBoxLayout()
+    #     row.addStretch(1)
+    #     self.btn_open_folder = QtWidgets.QPushButton("開啟檔案位置")
+    #     self.btn_open_folder.setEnabled(False)
+    #     self.btn_open_folder.clicked.connect(self._on_open_location_clicked)
+    #     sp = self.btn_open_folder.sizePolicy()
+    #     sp.setHorizontalPolicy(QtWidgets.QSizePolicy.Fixed)
+    #     sp.setVerticalPolicy(QtWidgets.QSizePolicy.Fixed)
+    #     self.btn_open_folder.setSizePolicy(sp)
+
+    #     row.addWidget(self.btn_open_folder)
+    #     outer.addLayout(row)
+
+    #     return panel
     def _build_info_panel(self) -> QtWidgets.QWidget:
         """右側資訊面板：不依賴 MainWindow 的 splitter_right，直接在本 widget 內建立。"""
         panel = QtWidgets.QWidget(self)
@@ -1125,6 +1168,12 @@ class GroupResultsWidget(QtWidgets.QWidget):
         self.info_path   = QtWidgets.QLabel("-")
         self.info_count  = QtWidgets.QLabel("-")
         
+        # ★ 關鍵修改：設定自動換行與忽略水平擴展，防止撐開視窗
+        for lbl in (self.info_uuid, self.info_subid, self.info_size, self.info_source, self.info_path, self.info_count):
+            lbl.setWordWrap(True)
+            lbl.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred)
+            lbl.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+
         form.addRow("UUID：",       self.info_uuid)
         form.addRow("子圖ID：",     self.info_subid)
         form.addRow("尺寸：",       self.info_size)
