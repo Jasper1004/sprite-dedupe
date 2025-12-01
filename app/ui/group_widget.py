@@ -435,28 +435,68 @@ class GroupResultsWidget(QtWidgets.QWidget):
         return groups
 
     def select_member_by_uuid(self, uuid_: str, sub_id: int | str | None = None) -> bool:
-        """在右側樹中尋找指定 uuid (+ sub_id) 的 'member' 節點並選取；若找到回傳 True。"""
-        if not hasattr(self, "tree") or self.tree is None:
-            return False
-        
+        """
+        在右側樹中尋找指定 uuid (+ sub_id) 的節點並選取。
+        ★ 修正：即使樹狀結構中找不到該節點，也強制更新右側視圖，確保畫面有東西。
+        """
+        # 1. 嘗試從隱藏的樹狀結構中選取 (視覺上的選取狀態)
         key = (uuid_, sub_id)
         leaf = self.member_item_map.get(key)
         
+        meta = None
         if leaf:
-            self.tree.setCurrentItem(leaf)
-
-            meta = leaf.data(0, QtCore.Qt.UserRole) or {}
-            self._update_views_from_meta(meta)
-            # self._last_selected_meta = meta
-            # self._on_pair_tree_select()
-
-            for btn_name in ("btn_open_location", "btn_open_folder"):
-                btn = getattr(self, btn_name, None)
-                if btn:
-                    btn.setEnabled(True)
-            return True
+            if hasattr(self, "tree") and self.tree:
+                self.tree.setCurrentItem(leaf)
+            meta = leaf.data(0, QtCore.Qt.UserRole)
         
-        return False
+        # 2. 如果樹狀結構找不到 (leaf is None)，手動建構 meta 資料
+        # 這是為了防止因為資料型態不一致 (int vs str) 或樹未建立而導致畫面空白
+        if not meta:
+            # 嘗試補全資訊
+            feat = self._load_feat(uuid_) or {}
+            p_uuid = feat.get("parent_uuid")
+            
+            # 嘗試正規化 sub_id (轉成 int) 以便比對
+            target_sid = None
+            if sub_id is not None:
+                try: target_sid = int(sub_id)
+                except: target_sid = str(sub_id)
+
+            bbox = None
+            if sub_id is not None:
+                # 嘗試從特徵中找 bbox
+                source_feat = self._load_feat(p_uuid) if p_uuid else feat
+                for si in (source_feat.get("sub_images") or []):
+                    # 寬鬆比對 sub_id
+                    si_sid = si.get("sub_id")
+                    try:
+                        if int(si_sid) == int(sub_id):
+                            bbox = si.get("bbox")
+                            break
+                    except:
+                        if str(si_sid) == str(sub_id):
+                            bbox = si.get("bbox")
+                            break
+
+            meta = {
+                "type": "member",
+                "uuid": uuid_,
+                "sub_id": sub_id,
+                "parent_uuid": p_uuid,
+                "bbox": bbox,
+                "group_id": p_uuid # 暫時假設 group_id = parent_uuid
+            }
+
+        # 3. ★ 關鍵：無論有沒有找到 leaf，都強制呼叫更新視圖
+        self._update_views_from_meta(meta)
+
+        # 4. 啟用相關按鈕
+        for btn_name in ("btn_open_location", "btn_open_folder"):
+            btn = getattr(self, btn_name, None)
+            if btn:
+                btn.setEnabled(True)
+                
+        return True
 
         # for i in range(self.tree.topLevelItemCount()):
         #     root = self.tree.topLevelItem(i)
@@ -499,19 +539,56 @@ class GroupResultsWidget(QtWidgets.QWidget):
         #         return True
         # return False
 
-    def set_project_root(self, root: str):
+    def set_project_root(self, root: str, cache_dir: str = None):
         self.project_root = root
-        self.features_dir = os.path.join(root, ".image_cache", "features")
+        base = cache_dir if cache_dir else os.path.join(root, ".image_cache")
+        self.features_dir = os.path.join(base, "features")
+        self._custom_cache_dir = cache_dir
 
+    # def load_from_results(self):
+    #     if not self.project_root:
+    #         return
+    #     p = os.path.join(self.project_root, ".image_cache", "results.json")
+    #     if not os.path.exists(p):
+    #         self.tree.clear(); self.leftView.clear(); self.rightView.clear(); return
+    #     with open(p, "r", encoding="utf-8") as f:
+    #         self.results = json.load(f)
+
+    #     self.groups = self.results.get("similarity_groups", []) or self._build_groups_from_pairs(self.results)
+
+    #     self.group_id_map = {
+    #         g.get("group_id"): g 
+    #         for g in self.groups 
+    #         if g.get("group_id")
+    #     }
+
+    #     self.group_pairs_map = {g.get("group_id"): g.get("pairs") or [] for g in self.groups}
+    #     self._rebuild_tree()
+    
     def load_from_results(self):
         if not self.project_root:
             return
-        p = os.path.join(self.project_root, ".image_cache", "results.json")
+        
+        base = getattr(self, "_custom_cache_dir", None)
+        if not base:
+            base = os.path.join(self.project_root, ".image_cache")
+            
+        p = os.path.join(base, "results.json")
+        
         if not os.path.exists(p):
-            self.tree.clear(); self.leftView.clear(); self.rightView.clear(); return
-        with open(p, "r", encoding="utf-8") as f:
-            self.results = json.load(f)
+            self.tree.clear()
+            self.leftView.clear()
+            self.rightView.clear()
+            return
 
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                self.results = json.load(f)
+        except Exception as e:
+            print(f"[Error] Failed to load results.json: {e}")
+            return
+
+        # ★ 關鍵：補回這段邏輯，將 JSON 轉換為群組結構
         self.groups = self.results.get("similarity_groups", []) or self._build_groups_from_pairs(self.results)
 
         self.group_id_map = {
@@ -586,27 +663,35 @@ class GroupResultsWidget(QtWidgets.QWidget):
                 return feat
         return None
         
+    # def features_iter(self):
+    #     """
+    #     逐一產生 (uuid, feature_dict)
+    #     來源：<project_root>/.image_cache/features/*.json
+    #     """
+    #     if not self.project_root:
+    #         return
+    #     features_dir = os.path.join(self.project_root, ".image_cache", "features")
+    #     if not os.path.isdir(features_dir):
+    #         return
+    #     for fn in os.listdir(features_dir):
+    #         if not fn.endswith(".json"):
+    #             continue
+    #         p = os.path.join(features_dir, fn)
+    #         try:
+    #             with open(p, "r", encoding="utf-8") as f:
+    #                 feat = json.load(f)
+    #         except Exception:
+    #             continue
+    #         uuid_ = feat.get("uuid") or fn[:-5]
+    #         yield uuid_, feat
     def features_iter(self):
-        """
-        逐一產生 (uuid, feature_dict)
-        來源：<project_root>/.image_cache/features/*.json
-        """
         if not self.project_root:
             return
-        features_dir = os.path.join(self.project_root, ".image_cache", "features")
-        if not os.path.isdir(features_dir):
-            return
-        for fn in os.listdir(features_dir):
-            if not fn.endswith(".json"):
-                continue
-            p = os.path.join(features_dir, fn)
-            try:
-                with open(p, "r", encoding="utf-8") as f:
-                    feat = json.load(f)
-            except Exception:
-                continue
-            uuid_ = feat.get("uuid") or fn[:-5]
-            yield uuid_, feat
+        # 使用 set_project_root 計算好的 features_dir
+        features_dir = getattr(self, "features_dir", None)
+        if not features_dir:
+             base = getattr(self, "_custom_cache_dir", None) or os.path.join(self.project_root, ".image_cache")
+             features_dir = os.path.join(base, "features")
 
     def _group_key_for_pair(self, A, B):
         pa = getattr(A, "parent_uuid", None)
@@ -719,33 +804,34 @@ class GroupResultsWidget(QtWidgets.QWidget):
         if self.mother_pixmap_cache is None:
             return None
             
-        return self.mother_pixmap_cache.get(parent_uuid)
-        # cached_pm = self.mother_pixmap_cache.get(parent_uuid)
-        # if cached_pm is not None:
-        #     return cached_pm
+        # 1. 先查快取
+        cached_pm = self.mother_pixmap_cache.get(parent_uuid)
+        if cached_pm is not None:
+            return cached_pm
 
-        # mf = self._load_feat(parent_uuid)
-        # if not mf or not mf.get("source_path") or not self.project_root:
-        #     return None
+        # 2. ★ 修正重點：快取沒有，嘗試從硬碟讀取 (同步讀取作爲後備) ★
+        # 這是為了防止 MainWindow 的非同步載入失敗或未觸發時，右側視窗也能正常顯示
+        mf = self._load_feat(parent_uuid)
+        if not mf: 
+            return None
+            
+        rel = mf.get("source_path")
+        if not rel or not self.project_root:
+            return None
         
-        # p = os.path.join(self.project_root, mf["source_path"])
-        # if not os.path.exists(p):
-        #     return None
+        # 組合路徑
+        p = rel if os.path.isabs(rel) else os.path.join(self.project_root, rel)
+        
+        if not os.path.exists(p):
+            return None
             
-        # pm = QtGui.QPixmap(p)
-
-        # if pm.isNull():
-        #     return None
+        pm = QtGui.QPixmap(p)
+        if pm.isNull():
+            return None
             
-        # MAX_SIZE = 2048
-        # if pm.width() > MAX_SIZE or pm.height() > MAX_SIZE:
-        #     pm = pm.scaled(
-        #         MAX_SIZE, MAX_SIZE,
-        #         QtCore.Qt.KeepAspectRatio,
-        #         QtCore.Qt.SmoothTransformation
-        #     )
-        # self.mother_pixmap_cache.put(parent_uuid, pm)
-        # return pm
+        # 讀到了就順便存入快取
+        self.mother_pixmap_cache.put(parent_uuid, pm)
+        return pm
 
     def _crop_from_sheet(self, parent_uuid: str, bbox) -> QtGui.QPixmap | None:
         pm = self._mother_pixmap(parent_uuid)
@@ -757,9 +843,69 @@ class GroupResultsWidget(QtWidgets.QWidget):
             return None
         return pm.copy(r)
 
+    # def _update_views_from_meta(self, meta: dict | None):
+    #     """(私有) 根據 meta 字典更新右側視圖和資訊面板。"""
+    #     self._last_selected_meta = meta
+    #     self.rightView.clear()
+
+    #     if not meta:
+    #         self._update_info_panel(None, None, None)
+    #         return
+
+    #     if meta.get("type") == "group":
+    #         gid = meta.get("group_id") or meta.get("parent_uuid")
+    #         self._update_info_panel(None, None, gid)
+    #         return
+        
+    #     uuid_  = meta.get("uuid")
+    #     sub_id = meta.get("sub_id")
+    #     gid    = meta.get("group_id")
+    #     self.current_uuid = uuid_
+
+    #     if sub_id is not None:
+    #         parent_uuid = uuid_ 
+    #         target_bbox_coords = meta.get("bbox")
+    #         mother = self._load_feat(parent_uuid) or {}
+    #         rel = mother.get("source_path")
+    #         if rel and self.project_root:
+    #             pm = self._mother_pixmap(parent_uuid)
+    #             if pm:
+    #                 self.rightView.show_image(pm, fit=True)
+    #                 if target_bbox_coords:
+    #                     original_sid_str = str(sub_id)
+    #                     target_bbox_dict = {
+    #                         "sub_id": original_sid_str, 
+    #                         "bbox": target_bbox_coords
+    #                     }
+    #                     self.rightView.draw_bboxes([target_bbox_dict])
+    #                     self.rightView.focus_bbox(original_sid_str)
+    #         self._update_info_panel(uuid_, sub_id, gid)
+    #         if hasattr(self, "btn_open_folder"):
+    #             self.btn_open_folder.setEnabled(bool(rel))
+    #         return
+        
+    #     feat = self._load_feat(uuid_) or {}
+    #     rel = feat.get("source_path")
+        
+    #     if rel and self.project_root and self.mother_pixmap_cache:
+    #         # 只從快取拿，絕對不 new QPixmap
+    #         pm = self.mother_pixmap_cache.get(uuid_)
+    #         if pm and not pm.isNull():
+    #             self.rightView.show_image(pm, fit=True)
+    #         else:
+    #             # 快取沒圖：這裡不該讀取，而是應該顯示空白或載入中
+    #             # 真正的讀取會由 MainWindow 的非同步機制觸發
+    #             self.rightView.clear()
+        
+    #     self._update_info_panel(uuid_, None, gid)
+    #     if hasattr(self, "btn_open_folder"):
+    #         self.btn_open_folder.setEnabled(bool(rel))
+
     def _update_views_from_meta(self, meta: dict | None):
         """(私有) 根據 meta 字典更新右側視圖和資訊面板。"""
         self._last_selected_meta = meta
+        
+        # 預設先清空，後面有圖再顯示
         self.rightView.clear()
 
         if not meta:
@@ -776,40 +922,67 @@ class GroupResultsWidget(QtWidgets.QWidget):
         gid    = meta.get("group_id")
         self.current_uuid = uuid_
 
+        # 1. 嘗試載入特徵資料 (為了取得路徑與母圖資訊)
+        feat = self._load_feat(uuid_) or {}
+        rel = feat.get("source_path")
+        parent_uuid = feat.get("parent_uuid")
+
+        # 2. 如果是子圖 (Sub Image)
         if sub_id is not None:
-            parent_uuid = uuid_ 
-            target_bbox_coords = meta.get("bbox")
+            # 如果 feat 沒讀到 parent_uuid，改從 meta 拿 (meta 通常會有)
+            if not parent_uuid: 
+                parent_uuid = uuid_ 
+            
+            # 嘗試讀取母圖特徵以取得路徑
             mother = self._load_feat(parent_uuid) or {}
-            rel = mother.get("source_path")
-            if rel and self.project_root:
-                pm = self._mother_pixmap(parent_uuid)
-                if pm:
-                    self.rightView.show_image(pm, fit=True)
-                    if target_bbox_coords:
-                        original_sid_str = str(sub_id)
-                        target_bbox_dict = {
-                            "sub_id": original_sid_str, 
-                            "bbox": target_bbox_coords
-                        }
-                        self.rightView.draw_bboxes([target_bbox_dict])
-                        self.rightView.focus_bbox(original_sid_str)
+            if not rel: 
+                rel = mother.get("source_path")
+            
+            # ★ 修正重點：優先檢查快取，只要快取有圖就顯示，不論 rel 是否存在
+            pm = self._mother_pixmap(parent_uuid)
+            if pm and not pm.isNull():
+                self.rightView.show_image(pm, fit=True)
+                
+                # 繪製 bbox
+                target_bbox_coords = meta.get("bbox")
+                if not target_bbox_coords:
+                    # 如果 meta 沒 bbox，試著從母圖特徵找
+                    for si in (mother.get("sub_images") or []):
+                        if str(si.get("sub_id")) == str(sub_id):
+                            target_bbox_coords = si.get("bbox")
+                            break
+                
+                if target_bbox_coords:
+                    self.rightView.draw_bboxes([{
+                        "sub_id": str(sub_id), 
+                        "bbox": target_bbox_coords
+                    }])
+                    self.rightView.focus_bbox(str(sub_id))
+            
             self._update_info_panel(uuid_, sub_id, gid)
             if hasattr(self, "btn_open_folder"):
                 self.btn_open_folder.setEnabled(bool(rel))
             return
         
-        feat = self._load_feat(uuid_) or {}
-        rel = feat.get("source_path")
-        
-        if rel and self.project_root and self.mother_pixmap_cache:
-            # 只從快取拿，絕對不 new QPixmap
+        # 3. 如果是單張圖 (Single Image)
+        # ★ 修正重點：優先檢查快取
+        pm = None
+        if self.mother_pixmap_cache:
             pm = self.mother_pixmap_cache.get(uuid_)
-            if pm and not pm.isNull():
-                self.rightView.show_image(pm, fit=True)
-            else:
-                # 快取沒圖：這裡不該讀取，而是應該顯示空白或載入中
-                # 真正的讀取會由 MainWindow 的非同步機制觸發
-                self.rightView.clear()
+        
+        # 如果快取有，直接顯示
+        if pm and not pm.isNull():
+            self.rightView.show_image(pm, fit=True)
+        # 如果快取沒有，但有路徑，試著讀讀看
+        elif rel and self.project_root:
+            abs_p = os.path.join(self.project_root, rel)
+            if os.path.exists(abs_p):
+                pm = QtGui.QPixmap(abs_p)
+                if not pm.isNull():
+                    self.rightView.show_image(pm, fit=True)
+                    # 順便存回快取
+                    if self.mother_pixmap_cache:
+                        self.mother_pixmap_cache.put(uuid_, pm)
         
         self._update_info_panel(uuid_, None, gid)
         if hasattr(self, "btn_open_folder"):
@@ -1244,38 +1417,50 @@ class GroupResultsWidget(QtWidgets.QWidget):
             QtWidgets.QMessageBox.warning(self, "開啟失敗", str(e))
 
 
+    # def _resolve_source_path(self, uuid_: str) -> str | None:
+    #     """由 uuid 找到來源路徑（若為子圖則回退到母圖），回傳絕對路徑。"""
+    #     if not getattr(self, "project_root", None):
+    #         return None
+    #     p = os.path.join(self.project_root, ".image_cache", "features", f"{uuid_}.json")
+    #     if not os.path.exists(p):
+    #         return None
+    #     try:
+    #         with open(p, "r", encoding="utf-8") as f:
+    #             feat = json.load(f)
+    #     except Exception:
+    #         return None
+
+    #     rel = feat.get("source_path")
+
+    #     if not rel:
+    #         pu = feat.get("parent_uuid")
+    #         if pu:
+    #             mp = os.path.join(self.project_root, ".image_cache", "features", f"{pu}.json")
+    #             if os.path.exists(mp):
+    #                 try:
+    #                     with open(mp, "r", encoding="utf-8") as mf:
+    #                         mother = json.load(mf)
+    #                     rel = mother.get("source_path")
+    #                 except Exception:
+    #                     rel = None
+
+    #     if not rel:
+    #         return None
+
+    #     abspath = os.path.join(self.project_root, rel)
+    #     return abspath if os.path.exists(abspath) else None
     def _resolve_source_path(self, uuid_: str) -> str | None:
         """由 uuid 找到來源路徑（若為子圖則回退到母圖），回傳絕對路徑。"""
         if not getattr(self, "project_root", None):
             return None
-        p = os.path.join(self.project_root, ".image_cache", "features", f"{uuid_}.json")
-        if not os.path.exists(p):
-            return None
-        try:
-            with open(p, "r", encoding="utf-8") as f:
-                feat = json.load(f)
-        except Exception:
-            return None
-
-        rel = feat.get("source_path")
-
-        if not rel:
-            pu = feat.get("parent_uuid")
-            if pu:
-                mp = os.path.join(self.project_root, ".image_cache", "features", f"{pu}.json")
-                if os.path.exists(mp):
-                    try:
-                        with open(mp, "r", encoding="utf-8") as mf:
-                            mother = json.load(mf)
-                        rel = mother.get("source_path")
-                    except Exception:
-                        rel = None
-
-        if not rel:
-            return None
-
-        abspath = os.path.join(self.project_root, rel)
-        return abspath if os.path.exists(abspath) else None
+            
+        # 取得正確的 features 目錄
+        f_dir = getattr(self, "features_dir", None)
+        if not f_dir:
+            base = getattr(self, "_custom_cache_dir", None) or os.path.join(self.project_root, ".image_cache")
+            f_dir = os.path.join(base, "features")
+            
+        p = os.path.join(f_dir, f"{uuid_}.json")
 
 
     def _open_current_in_explorer(self):

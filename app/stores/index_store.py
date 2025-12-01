@@ -3,9 +3,9 @@ from PyQt5 import QtCore
 from ..utils.atomic import atomic_write_json
 
 class IndexStore:
-    def __init__(self, project_root: str):
+    def __init__(self, project_root: str, cache_dir: str = None):
         self.root = project_root
-        self.cache_dir = os.path.join(self.root, ".image_cache")
+        self.cache_dir = cache_dir if cache_dir else os.path.join(self.root, ".image_cache")
         self.path = os.path.join(self.cache_dir, "index.json")
         self.data = {"version":"1.0","last_scan_timestamp":None,"image_map":{}}
         self._uuid_to_rel = {}

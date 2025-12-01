@@ -230,6 +230,7 @@ class ScanWorker(QtCore.QObject):
         spr_min_cover = self.task_args.get("spr_min_cover")
         phash_hamming_max_intra = self.task_args.get("phash_hamming_max_intra")
         phash_hamming_max = self.task_args.get("phash_hamming_max")
+        cache_dir = self.task_args.get("cache_dir")
 
         local_items_raw = []
         local_id2item = {}
@@ -240,8 +241,8 @@ class ScanWorker(QtCore.QObject):
         local_sheet_meta = {}
         local_json_payloads = {}
         
-        features_store = FeatureStore(project_root)
-        index_store = IndexStore(project_root)
+        features_store = FeatureStore(project_root, cache_dir=cache_dir)
+        index_store = IndexStore(project_root, cache_dir=cache_dir)
         index_store.load()
 
         try:
@@ -571,8 +572,11 @@ class ScanWorker(QtCore.QObject):
             self.progressStep.emit(current_done)
 
             self.logMessage.emit("正在寫入結果...")
+            out_dir = cache_dir if cache_dir else os.path.join(project_root, ".image_cache")
+            out_path = os.path.join(out_dir, "results.json")
+            
             if project_root:
-                write_results(project_root, local_pairs, local_id2item)
+                write_results(project_root, local_pairs, local_id2item, out_path=out_path)
 
             results = {
                 "error": None,
@@ -626,6 +630,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.logger = None
         self.worker_thread = None
         self.worker = None
+        self.custom_cache_root = None
 
         # self.thumb_json_cache = {}
         # self.thumb_pixmap_cache = {}
@@ -776,33 +781,35 @@ class MainWindow(QtWidgets.QMainWindow):
         """處理在橫向群組中圖片縮圖的點擊事件"""
         uuid_  = meta.get("uuid")
         sub_id = meta.get("sub_id") 
-        bbox = meta.get("bbox") # 記得多傳 bbox
+        bbox = meta.get("bbox")
         if not uuid_:
             return
 
-        # ★ 修改：不直接呼叫 group_view，而是走統一的非同步載入流程
-        # 我們直接複用 _apply_preview_to_ui 之前的檢查邏輯
-        
-        # 1. 嘗試找母圖 UUID (為了查快取 key)
-        parent_uuid = None
+        # 1. ★ 修正重點：確保讀取 Feature，以取得正確的 parent_uuid ★
+        # 如果快取沒有，務必呼叫 _load_feature_json 從硬碟讀
         feat = self.feature_json_cache.get(uuid_)
-        if feat: parent_uuid = feat.get("parent_uuid")
+        if not feat:
+            feat = self._load_feature_json(uuid_)
+            if feat:
+                self.feature_json_cache.put(uuid_, feat)
+
+        parent_uuid = feat.get("parent_uuid") if feat else None
         
+        # 決定快取用的 Key：有母圖就用母圖 ID，否則用自己的 ID
         cache_key = parent_uuid if parent_uuid else uuid_
         
         # 2. 檢查快取
         cached_pm = self.mother_pixmap_cache.get(cache_key)
         
         if cached_pm and not cached_pm.isNull():
-            # A. 快取有圖 -> 直接顯示 (這是最快路徑)
+            # A. 快取有圖 -> 直接顯示
             if hasattr(self, "group_view") and self.group_view:
                 self.group_view.select_member_by_uuid(uuid_, sub_id)
         else:
             # B. 快取沒圖 -> 啟動背景載入
-            # 這裡我們需要取得檔案路徑
             rel = feat.get("source_path") if feat else None
             
-            # 如果是子圖，feat 可能沒路徑，要找母圖
+            # 如果是子圖但沒路徑，試著找母圖的路徑
             if not rel and parent_uuid:
                  mfeat = self.feature_json_cache.get(parent_uuid)
                  if not mfeat:
@@ -811,15 +818,17 @@ class MainWindow(QtWidgets.QMainWindow):
                  if mfeat: rel = mfeat.get("source_path")
 
             if rel and self.project_root:
-                abs_p = os.path.join(self.project_root, rel)
+                # 組合路徑：若是相對路徑則加上 project_root，若是自訂儲存區的絕對路徑則直接用
+                base_dir = self._get_cache_dir() if os.path.isabs(rel) else self.project_root
+                
+                # 特例處理：如果是 features 裡的 source_path，通常是相對於專案根目錄
+                # 但為了保險，我們先用 project_root 試試
+                abs_p = rel if os.path.isabs(rel) else os.path.join(self.project_root, rel)
+                
                 if os.path.exists(abs_p):
+                    self._loading_path = abs_p
                     # 啟動載入器
-                    self._loading_path = abs_p # 更新當前關注路徑
-                    
-                    # 借用 ImageLoaderRunnable (注意參數順序: path, cache_key, sub_id, bbox)
                     runnable = ImageLoaderRunnable(abs_p, cache_key, sub_id, bbox)
-                    
-                    # 連接訊號 (載入完後更新 UI)
                     runnable.signals.loaded.connect(
                         lambda img, p, k, s, b: self._on_async_image_label_loaded(img, p, k, uuid_, s, b)
                     )
@@ -1028,10 +1037,12 @@ class MainWindow(QtWidgets.QMainWindow):
         # 1. 取得路徑與母圖資訊 (保持原樣)
         info = {}
         try:
-            feat_p = os.path.join(self.project_root, ".image_cache", "features", f"{uuid_}.json")
-            if os.path.exists(feat_p):
-                with open(feat_p, "r", encoding="utf-8") as f:
-                    info = json.load(f)
+            base_dir = self._get_cache_dir()
+            if base_dir:
+                feat_p = os.path.join(base_dir, "features", f"{uuid_}.json")
+                if os.path.exists(feat_p):
+                    with open(feat_p, "r", encoding="utf-8") as f:
+                        info = json.load(f)
         except Exception: pass
 
         parent_uuid = info.get("parent_uuid")
@@ -1041,10 +1052,12 @@ class MainWindow(QtWidgets.QMainWindow):
         bbox = None
         if parent_uuid:
             try:
-                mp = os.path.join(self.project_root, ".image_cache", "features", f"{parent_uuid}.json")
-                if os.path.exists(mp):
-                    with open(mp, "r", encoding="utf-8") as f:
-                        mother_info = json.load(f)
+                base_dir = self._get_cache_dir()
+                if base_dir:
+                    mp = os.path.join(base_dir, "features", f"{parent_uuid}.json")
+                    if os.path.exists(mp):
+                        with open(mp, "r", encoding="utf-8") as f:
+                            mother_info = json.load(f)
                     if not rel: rel = mother_info.get("source_path")
                     target_sid = str(sub_id) if sub_id is not None else None
                     if target_sid:
@@ -1154,7 +1167,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if getattr(self, "features", None) and getattr(self.features, "dir", None):
             feats_dir = self.features.dir
         elif getattr(self, "project_root", None):
-            feats_dir = os.path.join(self.project_root, ".image_cache", "features")
+            bd = self._get_cache_dir()
+            feats_dir = os.path.join(bd, "features") if bd else None
 
         if not feats_dir or not os.path.isdir(feats_dir):
             return
@@ -1189,7 +1203,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _load_feature_json(self, uuid_: str) -> dict | None:
         if not self.project_root: return None
-        p = os.path.join(self.project_root, ".image_cache", "features", f"{uuid_}.json")
+        
+        # ★ 修改：使用 _get_cache_dir() 動態取得正確路徑
+        base_dir = self._get_cache_dir()
+        if not base_dir: return None
+            
+        p = os.path.join(base_dir, "features", f"{uuid_}.json")
+        
         if not os.path.exists(p):
             return None
         try:
@@ -1784,13 +1804,19 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             if not getattr(self, "project_root", None):
                 raise RuntimeError("project_root is None")
-            res_p = os.path.join(self.project_root, ".image_cache", "results.json")
-            sim_groups = []
-            if os.path.exists(res_p):
+            
+            # ★ 修正重點：使用 _get_cache_dir() 取得正確的結果檔案路徑
+            cache_dir = self._get_cache_dir()
+            res_p = os.path.join(cache_dir, "results.json") if cache_dir else ""
+            
+            # 優先從記憶體取得 groups (GroupView 應該已經載好了)
+            sim_groups = getattr(self.group_view, "groups", [])
+            
+            # 如果記憶體是空的，且檔案存在，嘗試從檔案讀取 (後備方案)
+            if not sim_groups and res_p and os.path.exists(res_p):
                 with open(res_p, "r", encoding="utf-8") as f:
                     res = json.load(f)
-                sim_groups = self.group_view.groups 
-                if not sim_groups and hasattr(self.group_view, "_build_groups_from_pairs"):
+                if hasattr(self.group_view, "_build_groups_from_pairs"):
                     sim_groups = self.group_view._build_groups_from_pairs(res)
 
             for g in sim_groups:
@@ -1804,7 +1830,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if not groups:
             self.list_files.setRowCount(1)
-            # ... (顯示無結果，保持原樣) ...
+            # 這裡可以顯示一個 "尚無分群結果" 的提示，或者保持空白
             return
 
         self.object_groups = groups
@@ -1866,14 +1892,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 img_label.setAlignment(Qt.AlignCenter)
                 img_label.clicked.connect(self._on_image_label_clicked)
                 
-                # ★ 關鍵修改：不直接呼叫 _make_thumbnail，而是發起非同步任務
-                
-                # 1. 檢查快取 (如果有縮圖快取，直接顯示，最快)
-                cache_key = (uuid_, sub_id, icon_size) # 簡單的 key
-                # 注意：這裡我們需要一個能存取縮圖的 key，為了簡化，我們先試著查母圖快取
-                # 如果要嚴謹的縮圖快取，可以用 self.thumb_scaled_base_cache
-                # 但這裡為了效能，我們先一律設為 placeholder，然後丟進 thread pool
-                
+                # 1. 檢查快取
                 img_label.setPixmap(placeholder) # 先顯示空白
                 
                 # 取得檔案路徑
@@ -1892,20 +1911,13 @@ class MainWindow(QtWidgets.QMainWindow):
                     unique_id = f"{uuid_}_{sub_id}_{row_index}"
                     img_label.setObjectName(unique_id)
                     
-                    # 1. 建立這個任務專屬的訊號發射器 (WorkerSignals)
                     task_signal = WorkerSignals()
-                    
-                    # 2. 建立任務，並傳入這個專屬發射器
                     task = ThumbnailRunnable(
                         full_path, uuid_, sub_id, bbox, icon_size, task_signal
                     )
-                    
-                    # 3. ★ 關鍵：使用 lambda 閉包綁定這裡的 img_label
-                    # 這樣當圖片讀好時，程式就知道要把圖貼到哪一個 label 上
                     task_signal.loaded.connect(
                         lambda img, p, u, s, b, label=img_label: self._update_list_item_thumb(label, img)
                     )
-                    
                     self._thread_pool.start(task)
 
                 image_layout.addWidget(img_label)
@@ -1917,6 +1929,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.list_files.setRowHeight(row_index, icon_size + 20)
 
         self.lb_count.setText(f"群組：{len(groups)}")
+        self.list_files.scrollToTop()
 
     def _update_list_item_thumb(self, label, img):
         """背景縮圖完成後，更新 UI"""
@@ -2355,6 +2368,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.act_add_dir = QtWidgets.QAction(QtGui.QIcon.fromTheme("folder-open"), "新增資料夾", self)
         self.act_add_dir.setShortcut("Ctrl+Shift+O")
 
+        self.act_set_cache = QtWidgets.QAction(QtGui.QIcon.fromTheme("folder-new"), "設定儲存路徑", self)
+        self.act_set_cache.setToolTip("設定產生的 JSON 與快取檔案存放位置 (預設為專案目錄下)")
+
         self.act_clear = QtWidgets.QAction(QtGui.QIcon.fromTheme("edit-clear"), "清空", self)
         self.act_params = QtWidgets.QAction(QtGui.QIcon.fromTheme("preferences-system"), "參數…", self)
         self.act_params.setVisible(False)
@@ -2362,7 +2378,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.act_theme = QtWidgets.QAction("🌗 主題", self)
         self.act_theme.setCheckable(True)
 
-        for a in (self.act_add, self.act_add_dir, self.act_clear, self.act_theme, self.act_params, self.act_run):
+        for a in (self.act_add, self.act_add_dir, self.act_set_cache, self.act_clear, self.act_theme, self.act_params, self.act_run):
             self.toolbar.addAction(a)
 
         self.act_add.triggered.connect(self.on_add)
@@ -2371,6 +2387,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.act_clear.triggered.connect(self.on_clear)
         self.act_params.triggered.connect(self.on_params)
         self.act_run.triggered.connect(self.on_run)
+        self.act_set_cache.triggered.connect(self.on_set_cache_path)
 
         # act_add = QtWidgets.QAction(QtGui.QIcon.fromTheme("list-add"), "新增圖片", self)
 
@@ -2400,6 +2417,43 @@ class MainWindow(QtWidgets.QMainWindow):
         self.act_run.setShortcut("Ctrl+R")
         self.act_clear.setShortcut("Ctrl+Backspace")
 
+    def _get_cache_dir(self):
+        """取得當前的快取目錄"""
+        if self.custom_cache_root:
+            # ★ 關鍵：強制在自訂路徑下加一層 .image_cache
+            return os.path.join(self.custom_cache_root, ".image_cache")
+        
+        if self.project_root:
+            # 預設路徑
+            return os.path.join(self.project_root, ".image_cache")
+        return None
+
+    def on_set_cache_path(self):
+        """手動選擇快取儲存路徑"""
+        d = QtWidgets.QFileDialog.getExistingDirectory(self, "選擇快取存放資料夾")
+        if d:
+            self.custom_cache_root = d
+            self.sb_text.setText(f"快取路徑已設為：{d}")
+            
+            # 如果專案已經載入，嘗試重新初始化 Stores
+            if self.project_root:
+                self._reload_stores_with_new_path()
+
+    def _reload_stores_with_new_path(self):
+        """當路徑變更時，重新指向 Store (不一定搬移檔案，僅切換寫入位置)"""
+        cache_dir = self._get_cache_dir()
+        if not cache_dir: return
+        
+        os.makedirs(cache_dir, exist_ok=True)
+        self.index = IndexStore(self.project_root, cache_dir=cache_dir)
+        try: self.index.load()
+        except: pass
+        self.features = FeatureStore(self.project_root, cache_dir=cache_dir)
+        self.logger = ActionsLogger(self.project_root, cache_dir=cache_dir)
+        
+        # 通知 GroupView 更新讀取路徑
+        self.group_view.set_project_root(self.project_root, cache_dir=cache_dir)
+
     def eventFilter(self, obj, event):
         # 1. 處理滑鼠點擊 (跳出警告視窗)
         if event.type() == QtCore.QEvent.MouseButtonPress:
@@ -2410,9 +2464,12 @@ class MainWindow(QtWidgets.QMainWindow):
             btn_add = self.toolbar.widgetForAction(self.act_add)
             btn_dir = self.toolbar.widgetForAction(self.act_add_dir)
             btn_run = self.toolbar.widgetForAction(self.act_run)
+            btn_set_cache = self.toolbar.widgetForAction(self.act_set_cache)
+
+            target_btns = (btn_add, btn_dir, btn_run, btn_set_cache)
             
             # 檢查點擊的對象是否為這些按鈕之一，且處於禁用狀態
-            if obj in (btn_add, btn_dir, btn_run) and not obj.isEnabled():
+            if obj in target_btns and not obj.isEnabled():
                 QtWidgets.QMessageBox.warning(
                     self, 
                     "功能已鎖定", 
@@ -2837,20 +2894,24 @@ class MainWindow(QtWidgets.QMainWindow):
         root = QtWidgets.QFileDialog.getExistingDirectory(self, "選擇資料夾")
         if not root: return
         self.project_root = root
-        os.makedirs(os.path.join(root, ".image_cache"), exist_ok=True)
+        # os.makedirs(os.path.join(root, ".image_cache"), exist_ok=True)
 
-        self.index = IndexStore(root)
+        cd = self._get_cache_dir()
+
+        if cd:
+            os.makedirs(cd, exist_ok=True)
+
+        self.index = IndexStore(root, cache_dir=cd)
         # ★ 這行是關鍵：先載入舊的 index.json，如果沒有會安靜失敗，不影響第一次使用
         try:
             self.index.load()
         except Exception:
             pass
 
-        self.features = FeatureStore(root)
-        self.logger = ActionsLogger(root)
+        self.features = FeatureStore(root, cache_dir=cd)
+        self.logger = ActionsLogger(root, cache_dir=cd)
+        self.group_view.set_project_root(self.project_root, cache_dir=cd)
         self.logger.append("scan_started", {"project_root": root}, {"include_exts": list(self._image_exts())})
-        self.group_view.set_project_root(self.project_root)
-
         existing_paths = {it.src_path for it in self.items_raw if it.src_path}
         added = errors = 0
         
@@ -2943,19 +3004,20 @@ class MainWindow(QtWidgets.QMainWindow):
         if files and not self.project_root:
             root = os.path.dirname(files[0])
             self.project_root = root
-            os.makedirs(os.path.join(root, ".image_cache"), exist_ok=True)
+            
+            # 取得正確快取路徑
+            cd = self._get_cache_dir()
+            if cd:
+                os.makedirs(cd, exist_ok=True)
 
-            self.index = IndexStore(root)
-            # ★ 同樣先嘗試載入舊的 index.json
-            try:
-                self.index.load()
-            except Exception:
-                pass
+            # 傳入 cache_dir
+            self.index = IndexStore(root, cache_dir=cd)
+            try: self.index.load()
+            except: pass
 
-            self.features = FeatureStore(root)
-            self.logger = ActionsLogger(root)
-            self.logger.append("scan_started", {"project_root": root}, {"include_exts": list(self._image_exts())})
-            self.group_view.set_project_root(self.project_root)
+            self.features = FeatureStore(root, cache_dir=cd)
+            self.logger = ActionsLogger(root, cache_dir=cd)
+            self.group_view.set_project_root(self.project_root, cache_dir=cd)
 
         added = 0
         for p in files:
@@ -3083,12 +3145,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.act_run.setEnabled(True)
         self.act_add.setEnabled(True)
         self.act_add_dir.setEnabled(True)
+        self.act_set_cache.setEnabled(True)
         self.act_clear.setEnabled(True)
 
         self.act_add.setToolTip("新增圖片")
         self.act_add_dir.setToolTip("新增資料夾")
         self.act_run.setToolTip("開始處理")
         self.act_clear.setToolTip("清空")
+        self.act_set_cache.setToolTip("設定產生的 JSON 與快取檔案存放位置 (預設為專案目錄下)")
 
     def on_params(self):
         dlg = QtWidgets.QDialog(self)
@@ -3137,8 +3201,9 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         
         if self.project_root:
-            cache_results = os.path.join(self.project_root, ".image_cache", "results.json")
-            if os.path.exists(cache_results):
+            cache_dir = self._get_cache_dir()
+            cache_results = os.path.join(cache_dir, "results.json") if cache_dir else ""
+            if cache_results and os.path.exists(cache_results):
                 print("[Info] Found cached results, loading directly...")
                 self.sb_text.setText("正在讀取快取結果...")
                 
@@ -3158,12 +3223,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.act_run.setEnabled(False)
                 self.act_add.setEnabled(False)
                 self.act_add_dir.setEnabled(False)
+                self.act_set_cache.setEnabled(False)
                 self.act_clear.setEnabled(True)
 
                 locked_tip = "功能已鎖定：請先按「清空」移除目前結果"
                 self.act_add.setToolTip(locked_tip)
                 self.act_add_dir.setToolTip(locked_tip)
                 self.act_run.setToolTip(locked_tip)
+                self.act_set_cache.setToolTip(locked_tip)
                 self.act_clear.setToolTip("清空")
                 
                 # 直接返回，不啟動 Worker
@@ -3174,12 +3241,14 @@ class MainWindow(QtWidgets.QMainWindow):
             self.act_add.setEnabled(False)
             self.act_add_dir.setEnabled(False)
             self.act_clear.setEnabled(False)
+            self.act_set_cache.setEnabled(False)
             
             processing_tip = "⚠️ 系統正在處理中，請稍候..."
             self.act_add.setToolTip(processing_tip)
             self.act_add_dir.setToolTip(processing_tip)
             self.act_run.setToolTip(processing_tip)
             self.act_clear.setToolTip(processing_tip)
+            self.act_set_cache.setToolTip(processing_tip)
         except Exception:
             print("Warning: Cound not find act_run to disable.")
             
@@ -3194,6 +3263,7 @@ class MainWindow(QtWidgets.QMainWindow):
         task_args = {
             "input_order": list(self._input_order), 
             "project_root": self.project_root,
+            "cache_dir": self._get_cache_dir(),
             "alpha_thr": self.alpha_thr,
             "min_area": self.min_area,
             "min_size": self.min_size,
@@ -3230,12 +3300,14 @@ class MainWindow(QtWidgets.QMainWindow):
             self.act_run.setEnabled(False)
             self.act_add.setEnabled(False)
             self.act_add_dir.setEnabled(False)
+            self.act_set_cache.setEnabled(False)
             self.act_clear.setEnabled(True)
 
             locked_tip = "功能已鎖定：請先按「清空」移除目前結果"
             self.act_add.setToolTip(locked_tip)
             self.act_add_dir.setToolTip(locked_tip)
             self.act_run.setToolTip(locked_tip)
+            self.act_set_cache.setToolTip(locked_tip)
         except Exception:
             print("Warning: Could not find act_run to enable.")
 
@@ -3253,8 +3325,8 @@ class MainWindow(QtWidgets.QMainWindow):
         
         if getattr(self, "project_root", None):
             try:
-                self.index = IndexStore(self.project_root)
-                # IndexStore __init__ 會自動 load()，所以這樣就同步了
+                cd = self._get_cache_dir()
+                self.index = IndexStore(self.project_root, cache_dir=cd)
                 print("[Info] IndexStore reloaded to sync cache status.")
             except Exception as e:
                 print(f"[Warn] Failed to reload IndexStore: {e}")
@@ -3266,16 +3338,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.in_pair_ids = results.get("in_pair_ids", set())
         self.seen_pair_keys = results.get("seen_pair_keys", set())
 
-        # self.thumb_json_cache.clear()
-        # self.thumb_pixmap_cache.clear()
-        # self.thumb_scaled_base_cache = LRUCache(capacity=50)
-
-        # self.all_json_payloads = results.get("json_payloads", {})
-
-        # if self.all_json_payloads:
-        #     for uuid_, payload in self.all_json_payloads.items():
-        #         self.thumb_json_cache[uuid_] = payload
-
+        # 重置快取物件
         self.feature_json_cache = LRUCache(capacity=5000)
         self.mother_pixmap_cache = LRUCache(capacity=50)
         self.thumb_scaled_base_cache = LRUCache(capacity=500)
@@ -3283,8 +3346,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if hasattr(self, "group_view"):
             self.group_view.attach_caches(self.feature_json_cache, self.mother_pixmap_cache)
 
+        # 填入 Worker 傳回的 JSON payload，避免再次讀檔
         self.all_json_payloads = results.get("json_payloads", {})
-
         if self.all_json_payloads:
             for uuid_, payload in self.all_json_payloads.items():
                 self.feature_json_cache.put(uuid_, payload)
@@ -3452,13 +3515,14 @@ class MainWindow(QtWidgets.QMainWindow):
             
             self.project_root = root
             os.makedirs(os.path.join(root, ".image_cache"), exist_ok=True)
-            self.index = IndexStore(root)
+            cd = self._get_cache_dir() # 如果使用者之前已經設定過路徑，這裡會取到
+            self.index = IndexStore(root, cache_dir=cd)
             try: self.index.load()
             except: pass
-            self.features = FeatureStore(root)
-            self.logger = ActionsLogger(root)
+            self.features = FeatureStore(root, cache_dir=cd)
+            self.logger = ActionsLogger(root, cache_dir=cd)
+            self.group_view.set_project_root(self.project_root, cache_dir=cd)
             self.logger.append("scan_started", {"project_root": root}, {"mode": "drag_drop"})
-            self.group_view.set_project_root(self.project_root)
 
         added = 0
         errors = 0

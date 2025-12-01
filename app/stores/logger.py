@@ -3,8 +3,9 @@ from PyQt5 import QtCore
 from PyQt5.QtCore import Qt
 
 class ActionsLogger:
-    def __init__(self, project_root: str):
-        self.path = os.path.join(project_root, ".image_cache", "actions.log")
+    def __init__(self, project_root: str, cache_dir: str = None):
+        base_dir = cache_dir if cache_dir else os.path.join(project_root, ".image_cache")
+        self.path = os.path.join(base_dir, "actions.log")
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
 
     def append(self, action: str, target: dict, details: dict | None = None, result: str = "success"):
