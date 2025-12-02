@@ -247,7 +247,7 @@ class ScanWorker(QtCore.QObject):
             
             # ====== 步驟 1: 平行讀取圖片 ======
             self.logMessage.emit(f"步驟 1/4: 平行讀取 {total_input} 張圖片...")
-            self.progressInit.emit(0, total_input) 
+            self.progressInit.emit(0, total_input)
             current_progress = 0
 
             def _load_task(args):
@@ -278,7 +278,7 @@ class ScanWorker(QtCore.QObject):
 
             # ====== 步驟 2: 偵測 Spritesheet ======
             self.logMessage.emit("步驟 2/4: 偵測 Spritesheet...")
-            self.progressInit.emit(0, len(local_items_raw)) 
+            self.progressInit.emit(0, len(local_items_raw))
             current_progress = 0
             
             def _alpha_task(item):
@@ -297,7 +297,12 @@ class ScanWorker(QtCore.QObject):
                 if item is None: continue
                 if use_boxes is not None:
                     parent_uuid = item.id
-                    rel_path = os.path.relpath(item.src_path, project_root) if project_root and item.src_path else item.display_name
+                    # ★ 修正跨磁碟機路徑問題
+                    try:
+                        rel_path = os.path.relpath(item.src_path, project_root) if project_root and item.src_path else item.display_name
+                    except ValueError:
+                        rel_path = item.src_path
+
                     local_sheet_meta[parent_uuid] = {
                         "source_path": rel_path,
                         "dimensions": {"width": int(item.rgba.shape[1]), "height": int(item.rgba.shape[0])},
@@ -327,7 +332,7 @@ class ScanWorker(QtCore.QObject):
 
             # ====== 步驟 3: 特徵提取 ======
             self.logMessage.emit("步驟 3/4: 提取特徵...")
-            self.progressInit.emit(0, len(local_pool)) 
+            self.progressInit.emit(0, len(local_pool))
             current_progress = 0
             
             clean_item_ids = set()
@@ -348,17 +353,16 @@ class ScanWorker(QtCore.QObject):
                 calc_ar = float(w) / max(1.0, float(h))
                 calc_area = float(np.count_nonzero(item.rgba[..., 3] > alpha_thr) / (w * h))
 
-                # ★ 修正：確保縮放後的尺寸至少為 1x1，防止長寬比極端的圖片導致 crash
                 scale = min(64.0/w, 64.0/h)
                 if scale < 1.0:
                     import cv2
-                    new_w = max(1, int(w * scale))
-                    new_h = max(1, int(h * scale))
-                    small_rgba = cv2.resize(item.rgba, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                    # ★ 修正 OpenCV 縮放錯誤：確保最小尺寸為 1
+                    dw = max(1, int(w * scale))
+                    dh = max(1, int(h * scale))
+                    small_rgba = cv2.resize(item.rgba, (dw, dh), interpolation=cv2.INTER_AREA)
                 else:
                     small_rgba = item.rgba
                 
-                # 計算平均色
                 pixels = small_rgba.reshape(-1, 4)
                 valid_mask = pixels[:, 3] > alpha_thr
                 if np.any(valid_mask):
@@ -391,14 +395,13 @@ class ScanWorker(QtCore.QObject):
                 if not used_cache:
                     res_feat["phash_primary"]   = phash_from_canon_rgba(item.rgba, alpha_thr, pad_ratio=CANON_PAD_PRIMARY)
                     res_feat["phash_secondary"] = phash_from_canon_rgba(item.rgba, alpha_thr, pad_ratio=CANON_PAD_SECONDARY)
-                    res_feat["phash_alpha"] = phash_from_canon_alpha(item.rgba, alpha_thr=SHAPE_ALPHA_THR, pad_ratio=CANON_PAD_SECONDARY)
-                    res_feat["phash_edge"]  = phash_from_canon_edge(item.rgba, alpha_thr=SHAPE_ALPHA_THR, pad_ratio=CANON_PAD_SECONDARY)
                     
-                    # 顏色雜湊 (用於最後把關)
                     u, v = phash_from_canon_uv(item.rgba, alpha_thr, pad_ratio=CANON_PAD_PRIMARY)
                     res_feat["phash_u"] = u
                     res_feat["phash_v"] = v
-
+                    
+                    res_feat["phash_alpha"] = phash_from_canon_alpha(item.rgba, alpha_thr=SHAPE_ALPHA_THR, pad_ratio=CANON_PAD_SECONDARY)
+                    res_feat["phash_edge"]  = phash_from_canon_edge(item.rgba, alpha_thr=SHAPE_ALPHA_THR, pad_ratio=CANON_PAD_SECONDARY)
                     res_feat["area_ratio"]  = calc_area
                     res_feat["hgram_gray32"] = gray_hist32(item.rgba, alpha_thr)
 
@@ -445,8 +448,12 @@ class ScanWorker(QtCore.QObject):
                 try: rel_path = index_store._uuid_to_rel.get(uuid_)
                 except: pass
                 if not rel_path and item.src_path:
-                    try: rel_path = os.path.relpath(item.src_path, project_root)
-                    except: rel_path = item.src_path
+                    # ★ 修正跨磁碟機路徑問題
+                    try:
+                        rel_path = os.path.relpath(item.src_path, project_root)
+                    except ValueError:
+                        rel_path = item.src_path
+
                 payload = {"uuid": uuid_, "source_path": rel_path or item.display_name, "is_spritesheet": False, 
                            "dimensions": {"width": item.rgba.shape[1], "height": item.rgba.shape[0]}, "features": feat}
                 local_json_payloads[uuid_] = payload
@@ -487,7 +494,7 @@ class ScanWorker(QtCore.QObject):
 
             # ====== 步驟 4: 相似度比對 ======
             self.logMessage.emit("步驟 4/4: 執行相似度比對...")
-            self.progressInit.emit(0, 100) # 重置進度條 0~100%
+            self.progressInit.emit(0, 100)
             
             N = len(local_pool)
             
@@ -519,11 +526,9 @@ class ScanWorker(QtCore.QObject):
                 clean_i = id_i in clean_item_ids
 
                 for j in range(i + 1, N):
-                    # 1. AR & Area 快速篩選 (極快)
                     if abs(ar_i - pool_ars[j]) > ASPECT_TOL: continue
                     if abs(area_i - pool_area[j]) > CONTENT_AREA_TOL: continue
 
-                    # 2. 平均色篩選 (極快)
                     mc_j = pool_mc[j]
                     color_diff = abs(mc_i[0]-mc_j[0]) + abs(mc_i[1]-mc_j[1]) + abs(mc_i[2]-mc_j[2])
                     if color_diff > COLOR_DIFF_THR: 
@@ -543,7 +548,6 @@ class ScanWorker(QtCore.QObject):
                                 local_in_pair_ids.update([id_i, id_j])
                             continue
 
-                    # 3. pHash 預篩選
                     raw_dist = _hamming64(hash_i, pool_phash_p[j])
                     
                     p_j = pool_parents[j]
@@ -566,11 +570,9 @@ class ScanWorker(QtCore.QObject):
                     if final_dist > th:
                         continue
 
-                    # 4. 詳細檢查
                     if USE_SHAPE_CHECK and _hamming64(phash_alpha[id_i], phash_alpha[id_j]) > PHASH_SHAPE_MAX: continue
                     if USE_EDGE_CHECK and _hamming64(phash_edge[id_i], phash_edge[id_j]) > PHASH_EDGE_MAX: continue
                     
-                    # 顏色雜湊檢查 (UV Hash)
                     if USE_COLOR_CHECK:
                         hu = _hamming64(pool_phash_u[i], pool_phash_u[j])
                         hv = _hamming64(pool_phash_v[i], pool_phash_v[j])

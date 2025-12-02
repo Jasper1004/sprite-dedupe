@@ -33,7 +33,10 @@ class IndexStore:
         return False
 
     def rel(self, abs_path: str) -> str:
-        return os.path.relpath(abs_path, self.root)
+        try:
+            return os.path.relpath(abs_path, self.root)
+        except ValueError:
+            return abs_path
 
     def load(self):
         if os.path.exists(self.path):
