@@ -280,9 +280,31 @@ class ScanWorker(QtCore.QObject):
             self.logMessage.emit("步驟 2/4: 偵測 Spritesheet...")
             self.progressInit.emit(0, len(local_items_raw))
             current_progress = 0
+
+            force_whole_ids = set()
+            if index_store and index_store.data:
+                for meta in index_store.data.get("image_map", {}).values():
+                    if meta.get("force_whole") and meta.get("uuid"):
+                        force_whole_ids.add(meta["uuid"])
+
+            # 引入白名單設定 (若有)
+            try:
+                from ..constants import DO_NOT_SPLIT_WHITELIST, DO_NOT_SPLIT_PREFIXES
+            except ImportError:
+                DO_NOT_SPLIT_WHITELIST = set()
+                DO_NOT_SPLIT_PREFIXES = ()
             
             def _alpha_task(item):
                 if self._abort: return None
+
+                if item.id in force_whole_ids:
+                    return (item, None)
+                
+                if item.display_name in DO_NOT_SPLIT_WHITELIST:
+                    return (item, None)
+                if item.display_name.startswith(DO_NOT_SPLIT_PREFIXES):
+                    return (item, None)
+                
                 boxes_strict = alpha_cc_boxes(item.rgba, alpha_thr, min_area, min_size)
                 boxes_loose  = alpha_cc_boxes(item.rgba, alpha_thr, max(100, min_area // 2), max(4, min_size // 2))
                 is_sheet_strict = is_spritesheet(item.rgba, boxes_strict, spr_min_segs, spr_min_cover)
@@ -319,6 +341,12 @@ class ScanWorker(QtCore.QObject):
                         local_sheet_meta[parent_uuid]["sub_images"].append(
                             {"sub_id": i, "bbox": [int(x), int(y), int(w), int(h)], "sub_uuid": sub.id}
                         )
+
+                    item.keep = None
+                    item.rgba = trim_and_pad_rgba(item.rgba, pad=0)
+                    local_pool.append(item)
+                    local_id2item[item.id] = item
+
                 else:
                     item.keep = None
                     item.rgba = trim_and_pad_rgba(item.rgba, pad=0)
@@ -473,8 +501,20 @@ class ScanWorker(QtCore.QObject):
                         "area_ratio": area_map.get(sid), "hgram_gray32": hgram.tolist() if hgram is not None else None,
                     }
                     updated_sub.append({"sub_id": sub_info["sub_id"], "bbox": sub_info["bbox"], "features": sub_feat})
+
+                mother_features = {}
+                if parent_uuid in phash_primary:
+                     hgram = hgram_map.get(parent_uuid)
+                     mother_features = {
+                        "phash_primary": phash_primary.get(parent_uuid),
+                        "phash_u": phash_u.get(parent_uuid), "phash_v": phash_v.get(parent_uuid),
+                        "phash_alpha": phash_alpha.get(parent_uuid), "phash_edge": phash_edge.get(parent_uuid),
+                        "area_ratio": area_map.get(parent_uuid), 
+                        "hgram_gray32": hgram.tolist() if hgram is not None else None,
+                     }
+                    
                 m_payload = {"uuid": parent_uuid, "source_path": meta.get("source_path"), "is_spritesheet": True,
-                             "dimensions": meta.get("dimensions"), "sub_images": updated_sub, "features": {}}
+                             "dimensions": meta.get("dimensions"), "sub_images": updated_sub, "features": mother_features}
                 local_json_payloads[parent_uuid] = m_payload
                 features_store.save(parent_uuid, m_payload)
                 index_store.mark_clean_by_uuid(parent_uuid)
@@ -684,6 +724,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._thread_pool.setMaxThreadCount(4)
 
         QtWidgets.QApplication.instance().installEventFilter(self)
+        
+        self._grouped_data = []        
+        self._grouped_loaded_count = 0 
+        self._group_load_generation = 0
+
         self.setAcceptDrops(True)
 
     def _on_image_label_clicked(self, meta: dict):
@@ -691,6 +736,9 @@ class MainWindow(QtWidgets.QMainWindow):
         uuid_  = meta.get("uuid")
         sub_id = meta.get("sub_id") 
         bbox = meta.get("bbox")
+
+        self._last_selected_group_id = meta.get("group")
+
         if not uuid_:
             return
 
@@ -751,51 +799,140 @@ class MainWindow(QtWidgets.QMainWindow):
             return pm
         return pm.scaled(max_wh, max_wh, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
 
+    # def _refresh_file_list_input_mode(self):
+    #     """
+    #     以「加入順序」更新左側清單。
+    #     - 若是 QTableWidget：用 1 欄 N 列，列內放一個小容器（縮圖＋檔名）
+    #     - 若還是 QListWidget：退回舊作法，不崩潰
+    #     """
+    #     data = self._input_order or []
+    #     count = len(data)
+    #     self.lb_count.setText(f"已加入：{count}")
+
+    #     if isinstance(self.list_files, QtWidgets.QTableWidget):
+    #         self.list_files.clearContents()
+    #         self.list_files.setRowCount(count)
+    #         for row, (uuid_, rel) in enumerate(data):
+    #             cont = QtWidgets.QWidget()
+    #             cont.setObjectName("cellContainer")
+    #             h = QtWidgets.QHBoxLayout(cont)
+    #             h.setContentsMargins(8, 6, 8, 6)
+    #             h.setSpacing(8)
+
+    #             abs_path = rel if os.path.isabs(rel) else os.path.join(self.project_root or "", rel)
+    #             pm = self._thumbnail_from_path(abs_path, max_wh=48)
+
+    #             lb_thumb = QtWidgets.QLabel()
+    #             lb_thumb.setPixmap(pm)                        
+    #             lb_thumb.setFixedSize(48, 48)
+    #             lb_thumb.setScaledContents(False)             
+    #             lb_thumb.setAlignment(Qt.AlignCenter)         
+    #             lb_thumb.setProperty("role", "thumb")
+    #             h.addWidget(lb_thumb, 0)
+
+    #             name = os.path.basename(rel)
+    #             lb = QtWidgets.QLabel(name)
+    #             lb.setToolTip(rel)
+    #             h.addWidget(lb, 1)
+
+    #             self.list_files.setCellWidget(row, 0, cont)
+
+    #             it = QtWidgets.QTableWidgetItem()
+    #             it.setData(Qt.UserRole, {"uuid": uuid_, "rel": rel})
+    #             self.list_files.setItem(row, 0, it)
+
+    #         self.list_files.resizeRowsToContents()
+    #         return
+
+    #     if isinstance(self.list_files, QtWidgets.QListWidget):
+    #         self.list_files.clear()
+    #         for (uuid_, rel) in data:
+    #             it = QtWidgets.QListWidgetItem(os.path.basename(rel))
+    #             it.setData(Qt.UserRole, {"uuid": uuid_, "rel": rel})
+    #             self.list_files.addItem(it)
+
     def _refresh_file_list_input_mode(self):
         """
-        以「加入順序」更新左側清單。
-        - 若是 QTableWidget：用 1 欄 N 列，列內放一個小容器（縮圖＋檔名）
-        - 若還是 QListWidget：退回舊作法，不崩潰
+        以「加入順序」更新左側清單 (非同步縮圖版 + 固定行高 + 防卡頓 + 實時進度條)。
         """
         data = self._input_order or []
         count = len(data)
         self.lb_count.setText(f"已加入：{count}")
 
+        # 【修改 1】設定進度條範圍為檔案總數 (將跑馬燈改為實體進度)
+        self.progress.setRange(0, count)
+        self.progress.setValue(0)
+        self.progress.setVisible(True)
+
+        placeholder = QtGui.QPixmap(48, 48)
+        placeholder.fill(QtCore.Qt.transparent)
+
         if isinstance(self.list_files, QtWidgets.QTableWidget):
-            self.list_files.clearContents()
-            self.list_files.setRowCount(count)
-            for row, (uuid_, rel) in enumerate(data):
-                cont = QtWidgets.QWidget()
-                cont.setObjectName("cellContainer")
-                h = QtWidgets.QHBoxLayout(cont)
-                h.setContentsMargins(8, 6, 8, 6)
-                h.setSpacing(8)
+            # 暫停介面更新，避免每加一列就重繪一次造成卡頓
+            self.list_files.setUpdatesEnabled(False)
+            
+            try:
+                self.list_files.clearContents()
+                self.list_files.setRowCount(count)
+                self.list_files.setColumnCount(1)
+                
+                # 設定固定行高提升效能
+                self.list_files.verticalHeader().setDefaultSectionSize(64)
 
-                abs_path = rel if os.path.isabs(rel) else os.path.join(self.project_root or "", rel)
-                pm = self._thumbnail_from_path(abs_path, max_wh=48)
+                for row, (uuid_, rel) in enumerate(data):
+                    # 【修改 2】每 50 筆處理一次 UI 事件並更新進度條
+                    if row % 50 == 0:
+                        self.progress.setValue(row) # 更新進度
+                        QtWidgets.QApplication.processEvents()
 
-                lb_thumb = QtWidgets.QLabel()
-                lb_thumb.setPixmap(pm)                        
-                lb_thumb.setFixedSize(48, 48)
-                lb_thumb.setScaledContents(False)             
-                lb_thumb.setAlignment(Qt.AlignCenter)         
-                lb_thumb.setProperty("role", "thumb")
-                h.addWidget(lb_thumb, 0)
+                    cont = QtWidgets.QWidget()
+                    cont.setObjectName("cellContainer")
+                    h = QtWidgets.QHBoxLayout(cont)
+                    h.setContentsMargins(8, 6, 8, 6)
+                    h.setSpacing(8)
 
-                name = os.path.basename(rel)
-                lb = QtWidgets.QLabel(name)
-                lb.setToolTip(rel)
-                h.addWidget(lb, 1)
+                    lb_thumb = QtWidgets.QLabel()
+                    lb_thumb.setPixmap(placeholder) 
+                    lb_thumb.setFixedSize(48, 48)
+                    lb_thumb.setScaledContents(False)             
+                    lb_thumb.setAlignment(Qt.AlignCenter)         
+                    lb_thumb.setProperty("role", "thumb")
+                    h.addWidget(lb_thumb, 0)
 
-                self.list_files.setCellWidget(row, 0, cont)
+                    name = os.path.basename(rel)
+                    lb = QtWidgets.QLabel(name)
+                    lb.setToolTip(rel)
+                    h.addWidget(lb, 1)
 
-                it = QtWidgets.QTableWidgetItem()
-                it.setData(Qt.UserRole, {"uuid": uuid_, "rel": rel})
-                self.list_files.setItem(row, 0, it)
+                    self.list_files.setCellWidget(row, 0, cont)
 
-            self.list_files.resizeRowsToContents()
+                    it = QtWidgets.QTableWidgetItem()
+                    it.setData(Qt.UserRole, {"uuid": uuid_, "rel": rel})
+                    self.list_files.setItem(row, 0, it)
+
+                    # 啟動背景任務讀取縮圖
+                    abs_path = rel if os.path.isabs(rel) else os.path.join(self.project_root or "", rel)
+                    
+                    if abs_path and os.path.exists(abs_path):
+                        task_signal = WorkerSignals()
+                        task_signal.loaded.connect(
+                            lambda img, p, u, s, b, label=lb_thumb: self._update_list_item_thumb(label, img)
+                        )
+                        
+                        task = ThumbnailRunnable(
+                            abs_path, uuid_, None, None, 48, task_signal
+                        )
+                        self._thread_pool.start(task)
+            
+            finally:
+                # 恢復介面更新
+                self.list_files.setUpdatesEnabled(True)
+                # 【修改 3】確保進度條跑完
+                self.progress.setValue(count)
+
             return
 
+        # 舊版相容 (QListWidget)
         if isinstance(self.list_files, QtWidgets.QListWidget):
             self.list_files.clear()
             for (uuid_, rel) in data:
@@ -856,7 +993,10 @@ class MainWindow(QtWidgets.QMainWindow):
         
         cache_key = parent_uuid if parent_uuid else uuid_
 
+        # 更新資訊面板文字
         self.group_view._update_info_panel(uuid_, sub_id if parent_uuid else None, None)
+        
+        # 【關鍵修正】若是在 Input Mode (info 為空)，手動補上介面資訊並啟用按鈕
         if not info and rel and hasattr(self.group_view, "info_path"):
              dims = (info.get("dimensions") or {})
              w, h = dims.get("width"), dims.get("height")
@@ -864,6 +1004,9 @@ class MainWindow(QtWidgets.QMainWindow):
              self.group_view.info_size.setText(f"{w}x{h}" if w else "-")
              self.group_view.info_path.setText(rel)
              self.group_view.info_source.setText("尚未處理")
+             # 強制啟用按鈕
+             if hasattr(self.group_view, "btn_open_folder"):
+                 self.group_view.btn_open_folder.setEnabled(True)
 
         if not rel:
             self.group_view.rightView.clear()
@@ -1274,7 +1417,138 @@ class MainWindow(QtWidgets.QMainWindow):
         path_ok = bool(feat and feat.get("source_path"))
         self.btn_open_location.setEnabled(path_ok)
 
+    # def _refresh_file_list_grouped_mode(self):
+    #     self._list_mode = "grouped"
+    #     self.list_files.clear()
+    #     self.list_files.setRowCount(0)
+    #     self.list_files.setColumnCount(1)
+
+    #     groups = {}
+
+    #     try:
+    #         if not getattr(self, "project_root", None):
+    #             raise RuntimeError("project_root is None")
+            
+    #         cache_dir = self._get_cache_dir()
+    #         res_p = os.path.join(cache_dir, "results.json") if cache_dir else ""
+            
+    #         sim_groups = getattr(self.group_view, "groups", [])
+            
+    #         if not sim_groups and res_p and os.path.exists(res_p):
+    #             with open(res_p, "r", encoding="utf-8") as f:
+    #                 res = json.load(f)
+    #             if hasattr(self.group_view, "_build_groups_from_pairs"):
+    #                 sim_groups = self.group_view._build_groups_from_pairs(res)
+
+    #         for g in sim_groups:
+    #             gname = g.get("group_id") or "pairs"
+    #             for m in (g.get("members") or []):
+    #                 groups.setdefault(gname, []).append({
+    #                     "uuid": m.get("uuid"), "sub_id": m.get("sub_id"), "bbox": m.get("bbox")
+    #                 })
+    #     except Exception as e:
+    #         print(f"[WARN] loading similarity_groups failed: {e}")
+
+    #     if not groups:
+    #         self.list_files.setRowCount(1)
+    #         return
+
+    #     self.object_groups = groups
+    #     self.list_files.setRowCount(len(groups))
+        
+    #     if self.dark_mode:
+    #         colors = [QtGui.QColor("#111a2f"), QtGui.QColor("#0f162b")]
+    #     else:
+    #         colors = [QtGui.QColor("#eef2ff"), QtGui.QColor("#f7f8fb")]
+
+    #     sorted_groups = sorted(groups.items(), key=lambda kv: (-len(kv[1]), kv[0]))
+    #     icon_size = 120
+
+    #     placeholder = QtGui.QPixmap(icon_size, icon_size)
+    #     placeholder.fill(QtCore.Qt.transparent)
+        
+    #     for row_index, (gname, members) in enumerate(sorted_groups):
+    #         row_widget = QtWidgets.QWidget()
+    #         row_widget.setAutoFillBackground(True)
+    #         palette = row_widget.palette()
+    #         palette.setColor(QtGui.QPalette.Window, colors[row_index % len(colors)])
+    #         row_widget.setPalette(palette)
+            
+    #         row_layout = QtWidgets.QHBoxLayout(row_widget)
+    #         row_layout.setContentsMargins(15, 8, 15, 8)
+    #         row_layout.setSpacing(15)
+
+    #         comp_name = f"comp_{row_index + 1}"
+    #         header_label = QtWidgets.QLabel(f"<b>{comp_name}</b><br>({len(members)} 個)")
+    #         header_label.setFixedWidth(160)
+    #         header_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+    #         row_layout.addWidget(header_label)
+
+    #         scroll_area = QtWidgets.QScrollArea()
+    #         scroll_area.setWidgetResizable(True)
+    #         scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+    #         scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+    #         scroll_area.setFrameShape(QtWidgets.QFrame.NoFrame)
+    #         scroll_area.setStyleSheet("QScrollArea, QWidget, QLabel { background: transparent; border: none; }")
+
+    #         image_container = QtWidgets.QWidget()
+    #         image_layout = QtWidgets.QHBoxLayout(image_container)
+    #         image_layout.setContentsMargins(0, 0, 0, 0)
+    #         image_layout.setSpacing(10)
+    #         image_layout.setAlignment(Qt.AlignLeft)
+
+    #         for m in members:
+    #             uuid_ = m.get("uuid")
+    #             sub_id = m.get("sub_id")
+    #             bbox = m.get("bbox")
+                
+    #             metadata = {"uuid": uuid_, "sub_id": sub_id, "group": comp_name, "bbox": bbox}
+    #             img_label = ImageLabel(metadata)
+    #             img_label.setProperty("role", "thumb")
+    #             img_label.setFixedSize(icon_size, icon_size)
+    #             img_label.setAlignment(Qt.AlignCenter)
+    #             img_label.clicked.connect(self._on_image_label_clicked)
+                
+    #             img_label.setPixmap(placeholder)
+                
+    #             feat = self.feature_json_cache.get(uuid_)
+    #             if feat is None:
+    #                 feat = self._load_feature_json(uuid_) or {}
+    #                 self.feature_json_cache.put(uuid_, feat)
+                
+    #             rel = feat.get("source_path")
+    #             full_path = None
+    #             if self.project_root and rel:
+    #                 full_path = rel if os.path.isabs(rel) else os.path.join(self.project_root, rel)
+
+    #             if full_path:
+    #                 unique_id = f"{uuid_}_{sub_id}_{row_index}"
+    #                 img_label.setObjectName(unique_id)
+                    
+    #                 task_signal = WorkerSignals()
+    #                 task = ThumbnailRunnable(
+    #                     full_path, uuid_, sub_id, bbox, icon_size, task_signal
+    #                 )
+    #                 task_signal.loaded.connect(
+    #                     lambda img, p, u, s, b, label=img_label: self._update_list_item_thumb(label, img)
+    #                 )
+    #                 self._thread_pool.start(task)
+
+    #             image_layout.addWidget(img_label)
+
+    #         scroll_area.setWidget(image_container)
+    #         row_layout.addWidget(scroll_area)
+
+    #         self.list_files.setCellWidget(row_index, 0, row_widget)
+    #         self.list_files.setRowHeight(row_index, icon_size + 20)
+
+    #     self.lb_count.setText(f"群組：{len(groups)}")
+    #     self.list_files.scrollToTop()
+
     def _refresh_file_list_grouped_mode(self):
+        """
+        準備分群資料，並啟動「自動串流」載入機制。
+        """
         self._list_mode = "grouped"
         self.list_files.clear()
         self.list_files.setRowCount(0)
@@ -1311,96 +1585,279 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         self.object_groups = groups
-        self.list_files.setRowCount(len(groups))
         
+        # 排序並初始化
+        self._grouped_data = sorted(groups.items(), key=lambda kv: (-len(kv[1]), kv[0]))
+        self._grouped_loaded_count = 0
+        
+        self.lb_count.setText(f"群組：{len(groups)}")
+        
+        # === 【關鍵】啟動串流任務 ===
+        # 1. 更新任務代號 (這會讓任何舊的 loop 停止)
+        self._group_load_generation += 1
+        current_gen = self._group_load_generation
+        
+        # 2. 立即觸發第一批
+        self._stream_next_batch_recursive(current_gen)
+    
+    # def _stream_next_batch_recursive(self, generation):
+    #     """
+    #     自動連續載入：處理完一批後，自動排程下一批，直到全部載入完畢。
+    #     這會在主執行緒的事件循環空檔執行，保證 UI 不卡死且載入速度極快。
+    #     """
+    #     # 1. 檢查任務代號：如果代號變了(代表使用者按了清空或重新整理)，立刻停止
+    #     if generation != self._group_load_generation:
+    #         return
+
+    #     # 2. 檢查是否全部載入完畢
+    #     total = len(self._grouped_data)
+    #     if self._grouped_loaded_count >= total:
+    #         return
+
+    #     # 3. 設定這批次要處理的數量
+    #     # 建議設為 10~20，太小會因為頻繁切換 Context 變慢，太大會微卡
+    #     batch_size = 10 
+    #     start_idx = self._grouped_loaded_count
+    #     end_idx = min(start_idx + batch_size, total)
+    #     batch = self._grouped_data[start_idx:end_idx]
+        
+    #     if not batch: return
+
+    #     # 準備顏色與圖示
+    #     if self.dark_mode:
+    #         colors = [QtGui.QColor("#111a2f"), QtGui.QColor("#0f162b")]
+    #     else:
+    #         colors = [QtGui.QColor("#eef2ff"), QtGui.QColor("#f7f8fb")]
+
+    #     icon_size = 120
+    #     placeholder = QtGui.QPixmap(icon_size, icon_size)
+    #     placeholder.fill(QtCore.Qt.transparent)
+
+    #     # 暫停刷新以提升效能 (只針對這一小批次)
+    #     self.list_files.setUpdatesEnabled(False)
+    #     try:
+    #         # 擴充表格行數
+    #         current_rows = self.list_files.rowCount()
+    #         self.list_files.setRowCount(current_rows + len(batch))
+
+    #         for i, (gname, members) in enumerate(batch):
+    #             row_index = current_rows + i
+                
+    #             # 建立容器
+    #             row_widget = QtWidgets.QWidget()
+    #             row_widget.setAutoFillBackground(True)
+    #             palette = row_widget.palette()
+    #             palette.setColor(QtGui.QPalette.Window, colors[row_index % len(colors)])
+    #             row_widget.setPalette(palette)
+                
+    #             row_layout = QtWidgets.QHBoxLayout(row_widget)
+    #             row_layout.setContentsMargins(15, 8, 15, 8)
+    #             row_layout.setSpacing(15)
+
+    #             # 群組標題
+    #             real_idx = start_idx + i
+    #             comp_name = f"comp_{real_idx + 1}"
+                
+    #             header_label = QtWidgets.QLabel(f"<b>{comp_name}</b><br>({len(members)} 個)")
+    #             header_label.setFixedWidth(160)
+    #             header_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+    #             row_layout.addWidget(header_label)
+
+    #             # 橫向捲動區
+    #             scroll_area = QtWidgets.QScrollArea()
+    #             scroll_area.setWidgetResizable(True)
+    #             scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+    #             scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+    #             scroll_area.setFrameShape(QtWidgets.QFrame.NoFrame)
+    #             scroll_area.setStyleSheet("QScrollArea, QWidget, QLabel { background: transparent; border: none; }")
+
+    #             image_container = QtWidgets.QWidget()
+    #             image_layout = QtWidgets.QHBoxLayout(image_container)
+    #             image_layout.setContentsMargins(0, 0, 0, 0)
+    #             image_layout.setSpacing(10)
+    #             image_layout.setAlignment(Qt.AlignLeft)
+
+    #             # 建立群組內的縮圖
+    #             for m in members:
+    #                 uuid_ = m.get("uuid")
+    #                 sub_id = m.get("sub_id")
+    #                 bbox = m.get("bbox")
+                    
+    #                 metadata = {"uuid": uuid_, "sub_id": sub_id, "group": comp_name, "bbox": bbox}
+    #                 img_label = ImageLabel(metadata)
+    #                 img_label.setProperty("role", "thumb")
+    #                 img_label.setFixedSize(icon_size, icon_size)
+    #                 img_label.setAlignment(Qt.AlignCenter)
+    #                 img_label.clicked.connect(self._on_image_label_clicked)
+                    
+    #                 img_label.setPixmap(placeholder)
+                    
+    #                 # 讀取特徵並啟動背景讀圖
+    #                 feat = self.feature_json_cache.get(uuid_)
+    #                 if feat is None:
+    #                     feat = self._load_feature_json(uuid_) or {}
+    #                     self.feature_json_cache.put(uuid_, feat)
+                    
+    #                 rel = feat.get("source_path")
+    #                 full_path = None
+    #                 if self.project_root and rel:
+    #                     full_path = rel if os.path.isabs(rel) else os.path.join(self.project_root, rel)
+
+    #                 if full_path:
+    #                     task_signal = WorkerSignals()
+    #                     task = ThumbnailRunnable(
+    #                         full_path, uuid_, sub_id, bbox, icon_size, task_signal
+    #                     )
+    #                     task_signal.loaded.connect(
+    #                         lambda img, p, u, s, b, label=img_label: self._update_list_item_thumb(label, img)
+    #                     )
+    #                     self._thread_pool.start(task)
+
+    #                 image_layout.addWidget(img_label)
+
+    #             scroll_area.setWidget(image_container)
+    #             row_layout.addWidget(scroll_area)
+
+    #             self.list_files.setCellWidget(row_index, 0, row_widget)
+    #             self.list_files.setRowHeight(row_index, icon_size + 20)
+
+    #         self._grouped_loaded_count = end_idx
+
+    #     finally:
+    #         self.list_files.setUpdatesEnabled(True)
+        
+    #     # 4. 【關鍵魔法】排程下一次執行 (0ms 代表只要 UI 閒置就立刻執行)
+    #     QtCore.QTimer.singleShot(0, lambda: self._stream_next_batch_recursive(generation))
+
+    def _stream_next_batch_recursive(self, generation):
+        """
+        自動連續載入：處理完一批後，自動排程下一批，直到全部載入完畢。
+        這會在主執行緒的事件循環空檔執行，保證 UI 不卡死且載入速度極快。
+        """
+        # 1. 檢查任務代號
+        if generation != self._group_load_generation:
+            return
+
+        # 2. 檢查是否全部載入完畢
+        total = len(self._grouped_data)
+        if self._grouped_loaded_count >= total:
+            return
+
+        # 3. 設定這批次要處理的數量
+        batch_size = 10 
+        start_idx = self._grouped_loaded_count
+        end_idx = min(start_idx + batch_size, total)
+        batch = self._grouped_data[start_idx:end_idx]
+        
+        if not batch: return
+
         if self.dark_mode:
             colors = [QtGui.QColor("#111a2f"), QtGui.QColor("#0f162b")]
         else:
             colors = [QtGui.QColor("#eef2ff"), QtGui.QColor("#f7f8fb")]
 
-        sorted_groups = sorted(groups.items(), key=lambda kv: (-len(kv[1]), kv[0]))
         icon_size = 120
-
         placeholder = QtGui.QPixmap(icon_size, icon_size)
         placeholder.fill(QtCore.Qt.transparent)
-        
-        for row_index, (gname, members) in enumerate(sorted_groups):
-            row_widget = QtWidgets.QWidget()
-            row_widget.setAutoFillBackground(True)
-            palette = row_widget.palette()
-            palette.setColor(QtGui.QPalette.Window, colors[row_index % len(colors)])
-            row_widget.setPalette(palette)
-            
-            row_layout = QtWidgets.QHBoxLayout(row_widget)
-            row_layout.setContentsMargins(15, 8, 15, 8)
-            row_layout.setSpacing(15)
 
-            comp_name = f"comp_{row_index + 1}"
-            header_label = QtWidgets.QLabel(f"<b>{comp_name}</b><br>({len(members)} 個)")
-            header_label.setFixedWidth(160)
-            header_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
-            row_layout.addWidget(header_label)
+        # 暫停刷新以提升效能
+        self.list_files.setUpdatesEnabled(False)
+        try:
+            # 擴充表格行數
+            current_rows = self.list_files.rowCount()
+            self.list_files.setRowCount(current_rows + len(batch))
 
-            scroll_area = QtWidgets.QScrollArea()
-            scroll_area.setWidgetResizable(True)
-            scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-            scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-            scroll_area.setFrameShape(QtWidgets.QFrame.NoFrame)
-            scroll_area.setStyleSheet("QScrollArea, QWidget, QLabel { background: transparent; border: none; }")
-
-            image_container = QtWidgets.QWidget()
-            image_layout = QtWidgets.QHBoxLayout(image_container)
-            image_layout.setContentsMargins(0, 0, 0, 0)
-            image_layout.setSpacing(10)
-            image_layout.setAlignment(Qt.AlignLeft)
-
-            for m in members:
-                uuid_ = m.get("uuid")
-                sub_id = m.get("sub_id")
-                bbox = m.get("bbox")
+            for i, (gname, members) in enumerate(batch):
+                row_index = current_rows + i
                 
-                metadata = {"uuid": uuid_, "sub_id": sub_id, "group": comp_name, "bbox": bbox}
-                img_label = ImageLabel(metadata)
-                img_label.setProperty("role", "thumb")
-                img_label.setFixedSize(icon_size, icon_size)
-                img_label.setAlignment(Qt.AlignCenter)
-                img_label.clicked.connect(self._on_image_label_clicked)
+                # 建立容器
+                row_widget = QtWidgets.QWidget()
+                row_widget.setAutoFillBackground(True)
+                palette = row_widget.palette()
+                palette.setColor(QtGui.QPalette.Window, colors[row_index % len(colors)])
+                row_widget.setPalette(palette)
                 
-                img_label.setPixmap(placeholder)
-                
-                feat = self.feature_json_cache.get(uuid_)
-                if feat is None:
-                    feat = self._load_feature_json(uuid_) or {}
-                    self.feature_json_cache.put(uuid_, feat)
-                
-                rel = feat.get("source_path")
-                full_path = None
-                if self.project_root and rel:
-                    full_path = rel if os.path.isabs(rel) else os.path.join(self.project_root, rel)
+                row_layout = QtWidgets.QHBoxLayout(row_widget)
+                row_layout.setContentsMargins(15, 8, 15, 8)
+                row_layout.setSpacing(15)
 
-                if full_path:
-                    unique_id = f"{uuid_}_{sub_id}_{row_index}"
-                    img_label.setObjectName(unique_id)
+                # 群組標題
+                # 【修正】使用真實的 gname (例如 comp_58) 避免 ID 錯亂
+                # 另外顯示目前的排序順位 (#1, #2...) 供參考
+                rank = start_idx + i + 1
+                header_text = f"<b>{gname}</b><br><small>#{rank}</small> ({len(members)} 個)"
+                
+                header_label = QtWidgets.QLabel(header_text)
+                header_label.setFixedWidth(160)
+                header_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+                row_layout.addWidget(header_label)
+
+                # 橫向捲動區
+                scroll_area = QtWidgets.QScrollArea()
+                scroll_area.setWidgetResizable(True)
+                scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+                scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+                scroll_area.setFrameShape(QtWidgets.QFrame.NoFrame)
+                scroll_area.setStyleSheet("QScrollArea, QWidget, QLabel { background: transparent; border: none; }")
+
+                image_container = QtWidgets.QWidget()
+                image_layout = QtWidgets.QHBoxLayout(image_container)
+                image_layout.setContentsMargins(0, 0, 0, 0)
+                image_layout.setSpacing(10)
+                image_layout.setAlignment(Qt.AlignLeft)
+
+                # 建立群組內的縮圖
+                for m in members:
+                    uuid_ = m.get("uuid")
+                    sub_id = m.get("sub_id")
+                    bbox = m.get("bbox")
                     
-                    task_signal = WorkerSignals()
-                    task = ThumbnailRunnable(
-                        full_path, uuid_, sub_id, bbox, icon_size, task_signal
-                    )
-                    task_signal.loaded.connect(
-                        lambda img, p, u, s, b, label=img_label: self._update_list_item_thumb(label, img)
-                    )
-                    self._thread_pool.start(task)
+                    # 【修正】metadata["group"] 必須存入真實的 gname，這樣點擊時才能傳遞正確 ID
+                    metadata = {"uuid": uuid_, "sub_id": sub_id, "group": gname, "bbox": bbox}
+                    
+                    img_label = ImageLabel(metadata)
+                    img_label.setProperty("role", "thumb")
+                    img_label.setFixedSize(icon_size, icon_size)
+                    img_label.setAlignment(Qt.AlignCenter)
+                    img_label.clicked.connect(self._on_image_label_clicked)
+                    
+                    img_label.setPixmap(placeholder)
+                    
+                    feat = self.feature_json_cache.get(uuid_)
+                    if feat is None:
+                        feat = self._load_feature_json(uuid_) or {}
+                        self.feature_json_cache.put(uuid_, feat)
+                    
+                    rel = feat.get("source_path")
+                    full_path = None
+                    if self.project_root and rel:
+                        full_path = rel if os.path.isabs(rel) else os.path.join(self.project_root, rel)
 
-                image_layout.addWidget(img_label)
+                    if full_path:
+                        task_signal = WorkerSignals()
+                        task = ThumbnailRunnable(
+                            full_path, uuid_, sub_id, bbox, icon_size, task_signal
+                        )
+                        task_signal.loaded.connect(
+                            lambda img, p, u, s, b, label=img_label: self._update_list_item_thumb(label, img)
+                        )
+                        self._thread_pool.start(task)
 
-            scroll_area.setWidget(image_container)
-            row_layout.addWidget(scroll_area)
+                    image_layout.addWidget(img_label)
 
-            self.list_files.setCellWidget(row_index, 0, row_widget)
-            self.list_files.setRowHeight(row_index, icon_size + 20)
+                scroll_area.setWidget(image_container)
+                row_layout.addWidget(scroll_area)
 
-        self.lb_count.setText(f"群組：{len(groups)}")
-        self.list_files.scrollToTop()
+                self.list_files.setCellWidget(row_index, 0, row_widget)
+                self.list_files.setRowHeight(row_index, icon_size + 20)
+
+            self._grouped_loaded_count = end_idx
+
+        finally:
+            self.list_files.setUpdatesEnabled(True)
+        
+        # 4. 排程下一次執行
+        QtCore.QTimer.singleShot(0, lambda: self._stream_next_batch_recursive(generation))
 
     def _update_list_item_thumb(self, label, img):
         """背景縮圖完成後，更新 UI"""
@@ -1726,6 +2183,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.act_add_dir = QtWidgets.QAction(QtGui.QIcon.fromTheme("folder-open"), "新增資料夾", self)
         self.act_add_dir.setShortcut("Ctrl+Shift+O")
 
+        self.act_mark_whole = QtWidgets.QAction(QtGui.QIcon.fromTheme("object-group"), "標記為整圖", self)
+        self.act_mark_whole.setToolTip("將選取群組內的圖片標記為「強制不切割」 (適用於文字被誤拆的情況)")
+
         self.act_set_cache = QtWidgets.QAction(QtGui.QIcon.fromTheme("folder-new"), "設定儲存路徑", self)
         self.act_set_cache.setToolTip("設定產生的 JSON 與快取檔案存放位置 (預設為專案目錄下)")
 
@@ -1736,7 +2196,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.act_theme = QtWidgets.QAction("🌗 主題", self)
         self.act_theme.setCheckable(True)
 
-        for a in (self.act_add, self.act_add_dir, self.act_set_cache, self.act_clear, self.act_theme, self.act_params, self.act_run):
+        for a in (self.act_add, self.act_add_dir, self.act_set_cache, self.act_mark_whole, self.act_clear, self.act_theme, self.act_params, self.act_run):
             self.toolbar.addAction(a)
 
         self.act_add.triggered.connect(self.on_add)
@@ -1746,6 +2206,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.act_params.triggered.connect(self.on_params)
         self.act_run.triggered.connect(self.on_run)
         self.act_set_cache.triggered.connect(self.on_set_cache_path)
+        self.act_mark_whole.triggered.connect(self.on_mark_whole)
 
         self.act_theme.triggered.connect(self.toggle_theme)
 
@@ -1880,6 +2341,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.group_view.info_source,
                 self.group_view.info_path,
                 self.group_view.info_count,
+                self.group_view.info_marked,
             ),
         )
         info_widget.setObjectName("infoPanel")
@@ -2136,20 +2598,73 @@ class MainWindow(QtWidgets.QMainWindow):
             if right_sid and hasattr(self.rightView, "focus_bbox"):
                 self.rightView.focus_bbox(right_sid, margin=16, use_secondary=True)
 
+    # def _build_statusbar(self):
+    #     sb = QtWidgets.QStatusBar()
+    #     self.setStatusBar(sb)
+
+    #     self.sb_text = QtWidgets.QLabel("就緒")
+    #     sb.addWidget(self.sb_text)
+
+    #     self.progress = QtWidgets.QProgressBar()
+    #     self.progress.setRange(0, 100)
+    #     self.progress.setValue(0)
+    #     self.progress.setTextVisible(False)
+    #     sb.addPermanentWidget(self.progress, 1)
+
+    #     self.lb_pairs = QtWidgets.QLabel("相似結果：0 組（0 群）")
+    #     sb.addPermanentWidget(self.lb_pairs)
+
     def _build_statusbar(self):
         sb = QtWidgets.QStatusBar()
+        # 設定狀態列背景色，讓它與介面融合
+        sb.setStyleSheet("QStatusBar { background: #f7f8fb; border-top: 1px solid #e5e7eb; }")
         self.setStatusBar(sb)
 
-        self.sb_text = QtWidgets.QLabel("就緒")
-        sb.addWidget(self.sb_text)
+        # 建立一個容器 widget 來放狀態燈號與文字
+        container = QtWidgets.QWidget()
+        layout = QtWidgets.QHBoxLayout(container)
+        layout.setContentsMargins(10, 0, 0, 0)
+        layout.setSpacing(6)
 
+        # 狀態燈號 (使用圓形樣式)
+        self.status_led = QtWidgets.QLabel()
+        self.status_led.setFixedSize(10, 10)
+        self.status_led.setStyleSheet("background-color: #10b981; border-radius: 5px;") # 預設綠色
+
+        # 狀態文字
+        self.sb_text = QtWidgets.QLabel("系統就緒")
+        self.sb_text.setStyleSheet("color: #374151; font-weight: bold;")
+
+        layout.addWidget(self.status_led)
+        layout.addWidget(self.sb_text)
+        
+        # 加到狀態列最左邊
+        sb.addWidget(container)
+
+        # 進度條 (預設隱藏)
         self.progress = QtWidgets.QProgressBar()
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
         self.progress.setTextVisible(False)
-        sb.addPermanentWidget(self.progress, 1)
+        self.progress.setFixedWidth(900) # 【修改】加大寬度，讓它更明顯
+        # 美化進度條樣式
+        self.progress.setStyleSheet("""
+            QProgressBar {
+                border: none;
+                background-color: #e5e7eb;
+                border-radius: 4px;
+                height: 8px;
+            }
+            QProgressBar::chunk {
+                background-color: #4f46e5; 
+                border-radius: 4px;
+            }
+        """)
+        self.progress.setVisible(False) # 關鍵：一開始隱藏
+        sb.addPermanentWidget(self.progress)
 
         self.lb_pairs = QtWidgets.QLabel("相似結果：0 組（0 群）")
+        self.lb_pairs.setStyleSheet("color: #6b7280; margin-right: 15px;")
         sb.addPermanentWidget(self.lb_pairs)
 
     def _apply_theme(self):
@@ -2211,6 +2726,69 @@ class MainWindow(QtWidgets.QMainWindow):
             return None
         return None
 
+    # def on_add_dir(self):
+    #     root = QtWidgets.QFileDialog.getExistingDirectory(self, "選擇資料夾")
+    #     if not root: return
+    #     self.project_root = root
+    #     cd = self._get_cache_dir()
+
+    #     if cd:
+    #         os.makedirs(cd, exist_ok=True)
+
+    #     self.index = IndexStore(root, cache_dir=cd)
+    #     try:
+    #         self.index.load()
+    #     except Exception:
+    #         pass
+
+    #     self.features = FeatureStore(root, cache_dir=cd)
+    #     self.logger = ActionsLogger(root, cache_dir=cd)
+    #     self.group_view.set_project_root(self.project_root, cache_dir=cd)
+    #     self.logger.append("scan_started", {"project_root": root}, {"include_exts": list(self._image_exts())})
+    #     existing_paths = {it.src_path for it in self.items_raw if it.src_path}
+    #     added = errors = 0
+        
+    #     all_files = list(self._iter_image_files(root))
+        
+    #     for p in all_files:
+    #         abs_p = os.path.abspath(p)
+
+    #         if abs_p in self._input_paths:
+    #             continue
+            
+    #         try:
+    #             rel = os.path.relpath(abs_p, root)
+    #             uid = self.index.touch_file(abs_p)   
+                
+    #             self._input_paths.add(abs_p)      
+    #             self._input_order.append((uid, abs_p))
+    #             added += 1
+    #         except Exception as e:
+    #             errors += 1
+        
+    #     self.index.save()
+    #     self.logger.append("scan_finished", {"project_root": root}, {"new_or_touched": added, "errors": errors})
+        
+    #     self._refresh_file_list_input_mode()
+
+    #     if added or errors:
+    #         msg = f"從資料夾加入 {added} 張圖片"
+    #         if errors:
+    #             msg += f"（失敗 {errors}）"
+    #         self.sb_text.setText(msg)
+    #     else:
+    #         self.sb_text.setText("資料夾內未找到可用圖片")
+
+    #     self._refresh_file_list_input_mode()
+
+    #     if added or errors:
+    #         msg = f"從資料夾加入 {added} 張圖片"
+    #         if errors:
+    #             msg += f"（失敗 {errors}）"
+    #         self.sb_text.setText(msg)
+    #     else:
+    #         self.sb_text.setText("資料夾內未找到可用圖片")
+
     def on_add_dir(self):
         root = QtWidgets.QFileDialog.getExistingDirectory(self, "選擇資料夾")
         if not root: return
@@ -2219,6 +2797,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if cd:
             os.makedirs(cd, exist_ok=True)
+
+        # 顯示處理中狀態 (藍燈)
+        self.sb_text.setText("正在掃描資料夾...")
+        self.status_led.setStyleSheet("background-color: #3b82f6; border-radius: 5px;") # 藍色
+        self.progress.setVisible(True)
+        self.progress.setRange(0, 0)
+        QtWidgets.QApplication.processEvents()
 
         self.index = IndexStore(root, cache_dir=cd)
         try:
@@ -2230,12 +2815,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.logger = ActionsLogger(root, cache_dir=cd)
         self.group_view.set_project_root(self.project_root, cache_dir=cd)
         self.logger.append("scan_started", {"project_root": root}, {"include_exts": list(self._image_exts())})
-        existing_paths = {it.src_path for it in self.items_raw if it.src_path}
+        
         added = errors = 0
-        
         all_files = list(self._iter_image_files(root))
+        total_files = len(all_files)
         
-        for p in all_files:
+        for i, p in enumerate(all_files):
+            # 每處理 20 個檔案就刷新一次介面
+            if i % 20 == 0:
+                self.sb_text.setText(f"正在掃描 ({i}/{total_files})...")
+                QtWidgets.QApplication.processEvents()
+
             abs_p = os.path.abspath(p)
 
             if abs_p in self._input_paths:
@@ -2254,17 +2844,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.index.save()
         self.logger.append("scan_finished", {"project_root": root}, {"new_or_touched": added, "errors": errors})
         
-        self._refresh_file_list_input_mode()
-
-        if added or errors:
-            msg = f"從資料夾加入 {added} 張圖片"
-            if errors:
-                msg += f"（失敗 {errors}）"
-            self.sb_text.setText(msg)
-        else:
-            self.sb_text.setText("資料夾內未找到可用圖片")
+        # 【修改處】切換狀態文字時，確保燈號維持藍色
+        self.sb_text.setText("正在建立預覽列表...")
+        self.status_led.setStyleSheet("background-color: #3b82f6; border-radius: 5px;") # 確保是藍色
+        QtWidgets.QApplication.processEvents()
 
         self._refresh_file_list_input_mode()
+
+        # 全部完成後，恢復綠燈與隱藏進度條
+        self.progress.setVisible(False)
+        self.status_led.setStyleSheet("background-color: #10b981; border-radius: 5px;") # 綠色
 
         if added or errors:
             msg = f"從資料夾加入 {added} 張圖片"
@@ -2332,6 +2921,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._input_order.clear()
         self._input_paths.clear()
 
+        self._group_load_generation += 1 
+        self._grouped_data = []
+        self._grouped_loaded_count = 0
+
+        self._last_selected_group_id = None
+
         self._list_mode = "input"
 
         self.feature_json_cache = LRUCache(capacity=5000)
@@ -2343,6 +2938,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lb_count.setText("已加入：0")
         self.lb_pairs.setText("相似結果：0 組")
         self.sb_text.setText("已清空")
+
+        self.sb_text.setText("系統就緒")
+        self.status_led.setStyleSheet("background-color: #10b981; border-radius: 5px;") # 綠色
+        self.progress.setVisible(False) # 隱藏進度條
+        self.progress.setValue(0)
 
         if hasattr(self, "group_view"):
             try:
@@ -2413,7 +3013,116 @@ class MainWindow(QtWidgets.QMainWindow):
             self.sb_text.setText("已更新參數")
 
 
+    # def on_run(self):
+    #     self._t_start = time.time()
+    #     print("[timer] start:", self._t_start)
+
+    #     if self.worker_thread is not None:
+    #         QtWidgets.QMessageBox.information(self, "提示", "正在處理中，請稍候...")
+    #         return
+
+    #     if not self._input_order:
+    #         QtWidgets.QMessageBox.information(self, "提示", "請先新增圖片。")
+    #         return
+        
+    #     if self.project_root:
+    #         cache_dir = self._get_cache_dir()
+    #         cache_results = os.path.join(cache_dir, "results.json") if cache_dir else ""
+    #         if cache_results and os.path.exists(cache_results):
+    #             print("[Info] Found cached results, loading directly...")
+    #             self.sb_text.setText("正在讀取快取結果...")
+                
+    #             self.group_view.load_from_results()
+                
+    #             self._refresh_file_list_grouped_mode()
+                
+    #             self.progress.setValue(100)
+    #             group_count = len(self.group_view.groups) if self.group_view.groups else 0
+    #             pair_count = len(self.group_view.results.get('pairs', [])) if self.group_view.results else 0
+    #             self.lb_pairs.setText(f"相似結果：{pair_count} 組")
+    #             self.sb_text.setText(f"已讀取快取結果 ({group_count} 群)")
+
+    #             self.act_run.setEnabled(False)
+    #             self.act_add.setEnabled(False)
+    #             self.act_add_dir.setEnabled(False)
+    #             self.act_set_cache.setEnabled(False)
+    #             self.act_clear.setEnabled(True)
+
+    #             locked_tip = "功能已鎖定：請先按「清空」移除目前結果"
+    #             self.act_add.setToolTip(locked_tip)
+    #             self.act_add_dir.setToolTip(locked_tip)
+    #             self.act_run.setToolTip(locked_tip)
+    #             self.act_set_cache.setToolTip(locked_tip)
+    #             self.act_clear.setToolTip("清空")
+                
+    #             return
+        
+    #     try:
+    #         self.act_run.setEnabled(False)
+    #         self.act_add.setEnabled(False)
+    #         self.act_add_dir.setEnabled(False)
+    #         self.act_clear.setEnabled(False)
+    #         self.act_set_cache.setEnabled(False)
+            
+    #         processing_tip = "⚠️ 系統正在處理中，請稍候..."
+    #         self.act_add.setToolTip(processing_tip)
+    #         self.act_add_dir.setToolTip(processing_tip)
+    #         self.act_run.setToolTip(processing_tip)
+    #         self.act_clear.setToolTip(processing_tip)
+    #         self.act_set_cache.setToolTip(processing_tip)
+    #     except Exception:
+    #         print("Warning: Cound not find act_run to disable.")
+            
+    #     self.sb_text.setText("正在準備...")
+    #     self.status_led.setStyleSheet("background-color: #3b82f6; border-radius: 5px;")
+    #     self.progress.setVisible(True)
+    #     self.progress.setRange(0, 0) 
+    #     self.progress.setValue(0)
+    #     self.items_raw.clear()
+    #     self.id2item.clear()
+    #     self.pool.clear()
+    #     self.pairs.clear()
+
+    #     task_args = {
+    #         "input_order": list(self._input_order), 
+    #         "project_root": self.project_root,
+    #         "cache_dir": self._get_cache_dir(),
+    #         "alpha_thr": self.alpha_thr,
+    #         "min_area": self.min_area,
+    #         "min_size": self.min_size,
+    #         "spr_min_segs": self.spr_min_segs,
+    #         "spr_min_cover": self.spr_min_cover,
+    #         "phash_hamming_max_intra": self.phash_hamming_max_intra,
+    #         "phash_hamming_max": self.phash_hamming_max,
+    #     }
+
+    #     self.worker_thread = QtCore.QThread()
+    #     self.worker = ScanWorker(task_args)
+    #     self.worker.moveToThread(self.worker_thread)
+
+    #     self.worker.progressInit.connect(self.progress.setRange)
+    #     self.worker.progressStep.connect(self.progress.setValue)
+    #     self.worker.logMessage.connect(self.sb_text.setText)
+    #     self.worker.finished.connect(self.on_run_finished)
+        
+    #     self.worker_thread.started.connect(self.worker.run)
+    #     self.worker.finished.connect(self.worker_thread.quit)
+    #     self.worker.finished.connect(self.worker.deleteLater)
+    #     self.worker_thread.finished.connect(self.worker_thread.deleteLater)
+    #     self.worker_thread.finished.connect(self._on_worker_thread_finished) 
+
+    #     self.worker_thread.start()
+
     def on_run(self):
+        # 1. 更新狀態與介面
+        self.sb_text.setText("正在初始化與準備資料...")
+        self.status_led.setStyleSheet("background-color: #3b82f6; border-radius: 5px;") # 藍色
+        self.progress.setVisible(True)
+        self.progress.setRange(0, 0)
+        self.progress.setValue(0)
+        
+        QtWidgets.QApplication.processEvents()
+
         self._t_start = time.time()
         print("[timer] start:", self._t_start)
 
@@ -2423,20 +3132,45 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if not self._input_order:
             QtWidgets.QMessageBox.information(self, "提示", "請先新增圖片。")
+            self._reset_status_to_ready()
             return
         
-        if self.project_root:
+        # === 【關鍵修改】檢查是否有新圖片或更動 ===
+        # 預設假設沒有變更
+        has_dirty_files = False
+        
+        # 如果有建立索引，檢查裡面是否有檔案被標記為 dirty (新增或修改)
+        if self.index and self.project_root:
+            for uid, abs_path in self._input_order:
+                try:
+                    rel = self.index.rel(abs_path)
+                    meta = self.index.data["image_map"].get(rel)
+                    # 如果找不到 meta (新檔案) 或 dirty_features 為 True (有變更)
+                    if not meta or meta.get("dirty_features"):
+                        has_dirty_files = True
+                        break
+                except Exception:
+                    # 若發生路徑解析錯誤，保險起見視為有變更
+                    has_dirty_files = True
+                    break
+        
+        # 只有在「沒有變更 (not has_dirty_files)」的情況下，才允許直接讀取快取
+        # 這樣當您加入新圖片時，has_dirty_files 會是 True，就會跳過這裡，往下執行重新掃描
+        if not has_dirty_files and self.project_root:
             cache_dir = self._get_cache_dir()
             cache_results = os.path.join(cache_dir, "results.json") if cache_dir else ""
             if cache_results and os.path.exists(cache_results):
-                print("[Info] Found cached results, loading directly...")
+                print("[Info] Found cached results and NO changes detected, loading directly...")
                 self.sb_text.setText("正在讀取快取結果...")
+                QtWidgets.QApplication.processEvents() 
                 
                 self.group_view.load_from_results()
                 
                 self._refresh_file_list_grouped_mode()
                 
-                self.progress.setValue(100)
+                self.progress.setVisible(False)
+                self.status_led.setStyleSheet("background-color: #10b981; border-radius: 5px;")
+
                 group_count = len(self.group_view.groups) if self.group_view.groups else 0
                 pair_count = len(self.group_view.results.get('pairs', [])) if self.group_view.results else 0
                 self.lb_pairs.setText(f"相似結果：{pair_count} 組")
@@ -2447,6 +3181,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.act_add_dir.setEnabled(False)
                 self.act_set_cache.setEnabled(False)
                 self.act_clear.setEnabled(True)
+                self.act_mark_whole.setEnabled(True) 
 
                 locked_tip = "功能已鎖定：請先按「清空」移除目前結果"
                 self.act_add.setToolTip(locked_tip)
@@ -2457,6 +3192,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 
                 return
         
+        # === 以下為正常的 Worker 啟動流程 (當有新圖片時會執行到這裡) ===
         try:
             self.act_run.setEnabled(False)
             self.act_add.setEnabled(False)
@@ -2473,9 +3209,6 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             print("Warning: Cound not find act_run to disable.")
             
-        self.sb_text.setText("正在準備...")
-        self.progress.setRange(0, 0) 
-        self.progress.setValue(0)
         self.items_raw.clear()
         self.id2item.clear()
         self.pool.clear()
@@ -2511,6 +3244,164 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.worker_thread.start()
 
+    # def on_mark_whole(self):
+    #     """將選取群組的來源圖片標記為『強制不切割』"""
+    #     if self._list_mode != "grouped":
+    #         QtWidgets.QMessageBox.information(self, "提示", "請先執行處理，並在左側群組列表中選取要標記的項目。")
+    #         return
+        
+    #     rows = self.list_files.selectionModel().selectedRows()
+    #     if not rows:
+    #         QtWidgets.QMessageBox.information(self, "提示", "請先在左側列表選擇要標記的群組 (可多選)。")
+    #         return
+            
+    #     count = 0
+    #     touched_uuids = set()
+        
+    #     # 從選取的列中找出對應的群組資料
+    #     for idx in rows:
+    #         row = idx.row()
+    #         if row >= len(self._grouped_data): continue
+            
+    #         gname, members = self._grouped_data[row]
+    #         for m in members:
+    #             # 取得圖片的 UUID
+    #             # 如果是子圖 (uuid#sub_0)，我們需要它的母圖 UUID (uuid)
+    #             raw_uuid = m.get("uuid")
+    #             if raw_uuid:
+    #                 real_uuid = raw_uuid.split("#")[0]
+    #                 touched_uuids.add(real_uuid)
+
+    #     if not touched_uuids:
+    #         QtWidgets.QMessageBox.warning(self, "錯誤", "無法解析選取項目的圖片資訊。")
+    #         return
+
+    #     # 更新 IndexStore
+    #     if not self.index:
+    #          # 防呆：若 index 不存在嘗試重新載入
+    #          try:
+    #              if self.project_root:
+    #                  self.index = IndexStore(self.project_root, cache_dir=self._get_cache_dir())
+    #          except: pass
+        
+    #     if self.index:
+    #         for uid in touched_uuids:
+    #             self.index.set_force_whole(uid, True)
+    #             self.index.mark_dirty(uid) # 標記為骯髒，確保下次會重跑
+            
+    #         self.index.save()
+            
+    #         QtWidgets.QMessageBox.information(
+    #             self, 
+    #             "標記完成", 
+    #             f"已將 {len(touched_uuids)} 張來源圖片標記為『強制不切割』。\n\n"
+    #             "這些圖片在下次處理時將被視為單張完整圖片。\n"
+    #             "請點擊「開始處理」重新掃描以套用變更。"
+    #         )
+    #     else:
+    #          QtWidgets.QMessageBox.warning(self, "錯誤", "無法寫入索引檔 (IndexStore not loaded)。")
+
+    def on_mark_whole(self):
+        """將選取群組的來源圖片標記為『強制不切割』(含自動偵測與重複檢查)"""
+        if self._list_mode != "grouped":
+            QtWidgets.QMessageBox.information(self, "提示", "請先執行處理。")
+            return
+        
+        target_group_ids = set()
+        
+        # 優先順序 1: 使用最後點擊的圖片所屬群組 (最直覺)
+        if getattr(self, "_last_selected_group_id", None):
+            target_group_ids.add(self._last_selected_group_id)
+        
+        # 優先順序 2: 如果沒點圖片，嘗試從左側列表的選取列獲取
+        if not target_group_ids:
+            rows = self.list_files.selectionModel().selectedRows()
+            if rows:
+                for idx in rows:
+                    row = idx.row()
+                    if row < len(self._grouped_data):
+                        gname, _ = self._grouped_data[row]
+                        target_group_ids.add(gname)
+
+        if not target_group_ids:
+            QtWidgets.QMessageBox.information(self, "提示", "請先點擊任一圖片或選取群組。")
+            return
+
+        # 準備解析 UUID
+        touched_uuids = set()
+        
+        # 確保有群組資料
+        if not hasattr(self, "object_groups") or not self.object_groups:
+             QtWidgets.QMessageBox.warning(self, "錯誤", "找不到群組資料，請重新掃描。")
+             return
+
+        for gid in target_group_ids:
+            members = self.object_groups.get(gid, [])
+            for m in members:
+                raw_uuid = m.get("uuid")
+                if raw_uuid:
+                    # 去除子圖後綴，取得母圖 UUID
+                    real_uuid = raw_uuid.split("#")[0]
+                    touched_uuids.add(real_uuid)
+        
+        if not touched_uuids:
+            QtWidgets.QMessageBox.warning(self, "錯誤", "無法解析選取群組的圖片資訊。")
+            return
+
+        # 載入索引
+        if not self.index:
+             try:
+                 if self.project_root:
+                     self.index = IndexStore(self.project_root, cache_dir=self._get_cache_dir())
+             except: pass
+        
+        if not self.index:
+             QtWidgets.QMessageBox.warning(self, "錯誤", "無法讀取索引 (IndexStore)。")
+             return
+
+        # === 【關鍵邏輯】檢查是否已經標記過 ===
+        all_already_marked = True
+        for uid in touched_uuids:
+            rel = self.index._uuid_to_rel.get(uid)
+            if not rel: continue
+            
+            meta = self.index.data["image_map"].get(rel)
+            # 只要有一個檔案還沒被標記 (force_whole != True)，就不算「全部已標記」
+            if not meta or not meta.get("force_whole"):
+                all_already_marked = False
+                break
+        
+        # 準備顯示用的群組字串 (例如: "comp_5, comp_8")
+        g_ids_str = ", ".join(sorted(list(target_group_ids)))
+
+        if all_already_marked:
+            QtWidgets.QMessageBox.information(
+                self, 
+                "已標記", 
+                f"群組 {g_ids_str} 中的檔案已經被標記為『整圖』，無需重複操作。"
+            )
+            return
+
+        # === 執行標記 ===
+        for uid in touched_uuids:
+            self.index.set_force_whole(uid, True)
+            self.index.mark_dirty(uid) # 標記為 Dirty，確保下次會重跑
+            
+        self.index.save()
+        
+        QtWidgets.QMessageBox.information(
+            self, 
+            "標記完成", 
+            f"已將群組 {g_ids_str} 中的來源圖片標記為『強制不切割』。\n\n"
+            "請點擊「開始處理」重新掃描以套用變更。"
+        )
+    
+    def _reset_status_to_ready(self):
+        """輔助函式：將狀態重置為就緒"""
+        self.sb_text.setText("系統就緒")
+        self.status_led.setStyleSheet("background-color: #10b981; border-radius: 5px;")
+        self.progress.setVisible(False)
+
     @QtCore.pyqtSlot()
     def _on_worker_thread_finished(self):
         """(私有) QThread 結束時，清理參照並重新啟用按鈕"""
@@ -2535,8 +3426,11 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_run_finished(self, results):
         """(Slot) 接收 Worker 執行完畢的訊號"""
         
-        self.progress.setRange(0, 100)
-        self.progress.setValue(0)
+        self.progress.setVisible(False) # 隱藏進度條
+        self.status_led.setStyleSheet("background-color: #10b981; border-radius: 5px;") # 變回綠色
+        
+        # self.progress.setRange(0, 100)
+        # self.progress.setValue(0)
 
         if results.get("error"):
             self.sb_text.setText(f"處理失敗: {results['error']}")
@@ -2582,7 +3476,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sb_text.setText("配對完成，請於下方查看群組結果")
         
         self._refresh_file_list_grouped_mode()
-        self.progress.setValue(100)
+        # self.progress.setValue(100)
 
         t_end = time.time()
         elapsed = t_end - getattr(self, "_t_start", t_end)

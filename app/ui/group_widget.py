@@ -12,6 +12,24 @@ from ..core.features import crop_aspect_ratio
 from .widgets import BBoxGraphicsView
 from .dialogs import PairDecisionDialog as PairDialog
 
+class WorkerSignals(QtCore.QObject):
+    loaded = QtCore.pyqtSignal(str, object)
+
+class LoaderRunnable(QtCore.QRunnable):
+    def __init__(self, path, uuid_, signal_emitter):
+        super().__init__()
+        self.path = path
+        self.uuid = uuid_
+        self.emitter = signal_emitter
+
+    @QtCore.pyqtSlot()
+    def run(self):
+        if self.path and os.path.exists(self.path):
+            img = QtGui.QImage(self.path)
+            self.emitter.loaded.emit(self.uuid, img)
+        else:
+            self.emitter.loaded.emit(self.uuid, QtGui.QImage())
+
 class LRUCache:
     def __init__(self, capacity=50):
         self.cache = OrderedDict()
@@ -93,6 +111,9 @@ class GroupResultsWidget(QtWidgets.QWidget):
         self.sub_image_map_cache = LRUCache(capacity=50)
         self.mother_pixmap_cache = None
         self.feature_json_cache = None
+
+        self.thread_pool = QtCore.QThreadPool()
+        self._loading_uuid = None
 
         self.leftView  = BBoxGraphicsView(self)
         self.rightView = BBoxGraphicsView(self)
@@ -621,33 +642,39 @@ class GroupResultsWidget(QtWidgets.QWidget):
             self.pair_tree.setCurrentItem(self.pair_tree.topLevelItem(0))
             self._on_pair_tree_select()
 
+    # def _mother_pixmap(self, parent_uuid: str) -> QtGui.QPixmap | None:
+    #     if self.mother_pixmap_cache is None:
+    #         return None
+            
+    #     cached_pm = self.mother_pixmap_cache.get(parent_uuid)
+    #     if cached_pm is not None:
+    #         return cached_pm
+
+    #     mf = self._load_feat(parent_uuid)
+    #     if not mf: 
+    #         return None
+            
+    #     rel = mf.get("source_path")
+    #     if not rel or not self.project_root:
+    #         return None
+        
+    #     p = rel if os.path.isabs(rel) else os.path.join(self.project_root, rel)
+        
+    #     if not os.path.exists(p):
+    #         return None
+            
+    #     pm = QtGui.QPixmap(p)
+    #     if pm.isNull():
+    #         return None
+            
+    #     self.mother_pixmap_cache.put(parent_uuid, pm)
+    #     return pm
+
     def _mother_pixmap(self, parent_uuid: str) -> QtGui.QPixmap | None:
+        """只從快取讀取，不執行硬碟 I/O，避免卡住 UI。"""
         if self.mother_pixmap_cache is None:
             return None
-            
-        cached_pm = self.mother_pixmap_cache.get(parent_uuid)
-        if cached_pm is not None:
-            return cached_pm
-
-        mf = self._load_feat(parent_uuid)
-        if not mf: 
-            return None
-            
-        rel = mf.get("source_path")
-        if not rel or not self.project_root:
-            return None
-        
-        p = rel if os.path.isabs(rel) else os.path.join(self.project_root, rel)
-        
-        if not os.path.exists(p):
-            return None
-            
-        pm = QtGui.QPixmap(p)
-        if pm.isNull():
-            return None
-            
-        self.mother_pixmap_cache.put(parent_uuid, pm)
-        return pm
+        return self.mother_pixmap_cache.get(parent_uuid)
 
     def _crop_from_sheet(self, parent_uuid: str, bbox) -> QtGui.QPixmap | None:
         pm = self._mother_pixmap(parent_uuid)
@@ -658,11 +685,44 @@ class GroupResultsWidget(QtWidgets.QWidget):
         if r.isEmpty():
             return None
         return pm.copy(r)
+    
+    # --- [修改後] 整段覆蓋 (包含新增的方法) ---
+    def _on_bg_image_loaded(self, uuid_, img):
+        """背景圖片讀取完成後的回調"""
+        if img.isNull():
+            return
+
+        pm = QtGui.QPixmap.fromImage(img)
+        if self.mother_pixmap_cache:
+            self.mother_pixmap_cache.put(uuid_, pm)
+
+        # 只有當使用者目前還選著這張圖時，才更新畫面
+        if self._loading_uuid == uuid_:
+            if hasattr(self, "_last_selected_meta"):
+                self._update_views_from_meta(self._last_selected_meta)
+
+    def _display_image_and_bboxes(self, pm, mother_feat, sub_id, meta):
+        """輔助方法：顯示圖片與畫框"""
+        self.rightView.show_image(pm, fit=True)
+        
+        target_bbox_coords = meta.get("bbox")
+        if sub_id is not None:
+            if not target_bbox_coords:
+                for si in (mother_feat.get("sub_images") or []):
+                    if str(si.get("sub_id")) == str(sub_id):
+                        target_bbox_coords = si.get("bbox")
+                        break
+            
+            if target_bbox_coords:
+                self.rightView.draw_bboxes([{
+                    "sub_id": str(sub_id), 
+                    "bbox": target_bbox_coords
+                }])
+                self.rightView.focus_bbox(str(sub_id))
 
     def _update_views_from_meta(self, meta: dict | None):
-        """(私有) 根據 meta 字典更新右側視圖和資訊面板。"""
+        """根據 meta 字典更新右側視圖和資訊面板 (支援非同步)。"""
         self._last_selected_meta = meta
-        
         self.rightView.clear()
 
         if not meta:
@@ -679,59 +739,111 @@ class GroupResultsWidget(QtWidgets.QWidget):
         gid    = meta.get("group_id")
         self.current_uuid = uuid_
 
+        # 決定要讀取的母圖 UUID
         feat = self._load_feat(uuid_) or {}
         rel = feat.get("source_path")
         parent_uuid = feat.get("parent_uuid")
-
-        if sub_id is not None:
-            if not parent_uuid: 
-                parent_uuid = uuid_ 
-            
-            mother = self._load_feat(parent_uuid) or {}
-            if not rel: 
-                rel = mother.get("source_path")
-            
-            pm = self._mother_pixmap(parent_uuid)
-            if pm and not pm.isNull():
-                self.rightView.show_image(pm, fit=True)
-                
-                target_bbox_coords = meta.get("bbox")
-                if not target_bbox_coords:
-                    for si in (mother.get("sub_images") or []):
-                        if str(si.get("sub_id")) == str(sub_id):
-                            target_bbox_coords = si.get("bbox")
-                            break
-                
-                if target_bbox_coords:
-                    self.rightView.draw_bboxes([{
-                        "sub_id": str(sub_id), 
-                        "bbox": target_bbox_coords
-                    }])
-                    self.rightView.focus_bbox(str(sub_id))
-            
-            self._update_info_panel(uuid_, sub_id, gid)
-            if hasattr(self, "btn_open_folder"):
-                self.btn_open_folder.setEnabled(bool(rel))
-            return
-
-        pm = None
-        if self.mother_pixmap_cache:
-            pm = self.mother_pixmap_cache.get(uuid_)
         
+        target_load_uuid = parent_uuid if parent_uuid else uuid_
+        self._loading_uuid = target_load_uuid 
+
+        if not parent_uuid: 
+            mother_feat = feat
+        else:
+            mother_feat = self._load_feat(parent_uuid) or {}
+            if not rel: rel = mother_feat.get("source_path")
+
+        # 1. 嘗試從快取讀取
+        pm = self._mother_pixmap(target_load_uuid)
+
         if pm and not pm.isNull():
-            self.rightView.show_image(pm, fit=True)
+            # 命中快取，直接顯示
+            self._display_image_and_bboxes(pm, mother_feat, sub_id, meta)
         elif rel and self.project_root:
+            # 2. 沒命中快取，啟動背景載入
             abs_p = os.path.join(self.project_root, rel)
             if os.path.exists(abs_p):
-                pm = QtGui.QPixmap(abs_p)
-                if not pm.isNull():
-                    self.rightView.show_image(pm, fit=True)
-                    if self.mother_pixmap_cache:
-                        self.mother_pixmap_cache.put(uuid_, pm)
+                worker = LoaderRunnable(abs_p, target_load_uuid, WorkerSignals())
+                worker.emitter.loaded.connect(self._on_bg_image_loaded)
+                self.thread_pool.start(worker)
         
-        self._update_info_panel(uuid_, None, gid)
+        self._update_info_panel(uuid_, sub_id if parent_uuid else None, gid)
         if hasattr(self, "btn_open_folder"):
             self.btn_open_folder.setEnabled(bool(rel))
+
+    # def _update_views_from_meta(self, meta: dict | None):
+    #     """(私有) 根據 meta 字典更新右側視圖和資訊面板。"""
+    #     self._last_selected_meta = meta
+        
+    #     self.rightView.clear()
+
+    #     if not meta:
+    #         self._update_info_panel(None, None, None)
+    #         return
+
+    #     if meta.get("type") == "group":
+    #         gid = meta.get("group_id") or meta.get("parent_uuid")
+    #         self._update_info_panel(None, None, gid)
+    #         return
+        
+    #     uuid_  = meta.get("uuid")
+    #     sub_id = meta.get("sub_id")
+    #     gid    = meta.get("group_id")
+    #     self.current_uuid = uuid_
+
+    #     feat = self._load_feat(uuid_) or {}
+    #     rel = feat.get("source_path")
+    #     parent_uuid = feat.get("parent_uuid")
+
+    #     if sub_id is not None:
+    #         if not parent_uuid: 
+    #             parent_uuid = uuid_ 
+            
+    #         mother = self._load_feat(parent_uuid) or {}
+    #         if not rel: 
+    #             rel = mother.get("source_path")
+            
+    #         pm = self._mother_pixmap(parent_uuid)
+    #         if pm and not pm.isNull():
+    #             self.rightView.show_image(pm, fit=True)
+                
+    #             target_bbox_coords = meta.get("bbox")
+    #             if not target_bbox_coords:
+    #                 for si in (mother.get("sub_images") or []):
+    #                     if str(si.get("sub_id")) == str(sub_id):
+    #                         target_bbox_coords = si.get("bbox")
+    #                         break
+                
+    #             if target_bbox_coords:
+    #                 self.rightView.draw_bboxes([{
+    #                     "sub_id": str(sub_id), 
+    #                     "bbox": target_bbox_coords
+    #                 }])
+    #                 self.rightView.focus_bbox(str(sub_id))
+            
+    #         self._update_info_panel(uuid_, sub_id, gid)
+    #         if hasattr(self, "btn_open_folder"):
+    #             self.btn_open_folder.setEnabled(bool(rel))
+    #         return
+
+    #     pm = None
+    #     if self.mother_pixmap_cache:
+    #         pm = self.mother_pixmap_cache.get(uuid_)
+        
+    #     if pm and not pm.isNull():
+    #         self.rightView.show_image(pm, fit=True)
+    #     elif rel and self.project_root:
+    #         abs_p = os.path.join(self.project_root, rel)
+    #         if os.path.exists(abs_p):
+    #             pm = QtGui.QPixmap(abs_p)
+    #             if not pm.isNull():
+    #                 self.rightView.show_image(pm, fit=True)
+    #                 if self.mother_pixmap_cache:
+    #                     self.mother_pixmap_cache.put(uuid_, pm)
+        
+    #     self._update_info_panel(uuid_, None, gid)
+    #     if hasattr(self, "btn_open_folder"):
+    #         self.btn_open_folder.setEnabled(bool(rel))
 
     def _on_pair_tree_select(self):
         """群組樹／成員被點選時：右側顯示影像 + 更新資訊欄。"""
@@ -921,16 +1033,22 @@ class GroupResultsWidget(QtWidgets.QWidget):
             pass
 
     def _build_info_panel(self) -> QtWidgets.QWidget:
-        """右側資訊面板：不依賴 MainWindow 的 splitter_right，直接在本 widget 內建立。"""
+        """右側資訊面板：使用 Grid Layout 並配合 SizePolicy 實現自動換行"""
         panel = QtWidgets.QWidget(self)
+        
+        # 設定 Panel 自身為 Preferred，避免消失
+        panel.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Preferred)
 
         outer = QtWidgets.QVBoxLayout(panel)
-        outer.setContentsMargins(8, 8, 8, 8)
-        outer.setSpacing(6)
+        outer.setContentsMargins(12, 12, 12, 12)
+        outer.setSpacing(10)
 
-        form  = QtWidgets.QFormLayout()
-        form.setContentsMargins(0, 0, 0, 0)
-        form.setSpacing(6)
+        grid = QtWidgets.QGridLayout()
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setSpacing(10)
+        
+        # 設定第 1 欄 (數值欄) 佔據多餘空間，這對自動換行很重要
+        grid.setColumnStretch(1, 1)
 
         self.info_uuid   = QtWidgets.QLabel("-")
         self.info_subid  = QtWidgets.QLabel("-")
@@ -938,27 +1056,52 @@ class GroupResultsWidget(QtWidgets.QWidget):
         self.info_source = QtWidgets.QLabel("-")
         self.info_path   = QtWidgets.QLabel("-")
         self.info_count  = QtWidgets.QLabel("-")
+        self.info_marked = QtWidgets.QLabel("-")
         
-        for lbl in (self.info_uuid, self.info_subid, self.info_size, self.info_source, self.info_path, self.info_count):
+        target_labels = (
+            self.info_uuid, self.info_subid, self.info_size, 
+            self.info_source, self.info_path, self.info_count,
+            self.info_marked
+        )
+
+        for lbl in target_labels:
+            # 1. 啟用自動換行
             lbl.setWordWrap(True)
-            lbl.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred)
+            # 2. 內容靠左靠上
+            lbl.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
+            
+            # 3. 【關鍵】Ignored + Minimum
+            # Ignored: 忽略文字原本的長度 (允許被壓縮，這樣才會觸發換行)
+            # Minimum: 換行後高度變高，自動撐開垂直空間
+            lbl.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Minimum)
+            lbl.setMinimumWidth(1) # 騙過 Layout 允許縮到很小
+            
             lbl.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
 
-        form.addRow("UUID：",       self.info_uuid)
-        form.addRow("子圖ID：",     self.info_subid)
-        form.addRow("尺寸：",       self.info_size)
-        form.addRow("來源：",       self.info_source)
-        form.addRow("路徑：",       self.info_path)
-        form.addRow("同群數量：",    self.info_count)
-        
-        outer.addLayout(form)
-        outer.addStretch(1)
+        def add_row(row, text, value_widget):
+            lb = QtWidgets.QLabel(text)
+            lb.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignTop)
+            lb.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Preferred)
+            grid.addWidget(lb, row, 0)
+            grid.addWidget(value_widget, row, 1)
 
+        add_row(0, "UUID：",    self.info_uuid)
+        add_row(1, "子圖ID：",  self.info_subid)
+        add_row(2, "尺寸：",    self.info_size)
+        add_row(3, "來源：",    self.info_source)
+        add_row(4, "路徑：",    self.info_path)
+        add_row(5, "同群數量：", self.info_count)
+        add_row(6, "標記整圖：", self.info_marked)
+        
+        outer.addLayout(grid)
+        outer.addStretch(1)
+        
         row = QtWidgets.QHBoxLayout()
         row.addStretch(1)
         self.btn_open_folder = QtWidgets.QPushButton("開啟檔案位置")
         self.btn_open_folder.setEnabled(False)
         self.btn_open_folder.clicked.connect(self._on_open_location_clicked)
+        
         sp = self.btn_open_folder.sizePolicy()
         sp.setHorizontalPolicy(QtWidgets.QSizePolicy.Fixed)
         sp.setVerticalPolicy(QtWidgets.QSizePolicy.Fixed)
@@ -970,42 +1113,52 @@ class GroupResultsWidget(QtWidgets.QWidget):
         return panel
 
     def _on_open_location_clicked(self):
-        """以目前樹狀選取的成員，開啟來源檔案位置。"""
-        it = self.tree.currentItem()
-        if not it:
-            return
-        meta = it.data(0, QtCore.Qt.UserRole) or {}
-        if meta.get("type") != "member":
-            if it.childCount():
-                it = it.child(0)
-                meta = it.data(0, QtCore.Qt.UserRole) or {}
+        """以目前樹狀選取的成員，開啟來源檔案位置"""
+        path_to_open = None
+        uuid_ = None
+        
+        if hasattr(self, "tree") and self.tree.currentItem():
+            meta = self.tree.currentItem().data(0, QtCore.Qt.UserRole) or {}
+            uuid_ = meta.get("uuid")
+
+        if uuid_ and self.project_root:
+            feat = self._load_feat(uuid_) or {}
+            rel = feat.get("source_path")
+            if not rel:
+                parent_uuid = feat.get("parent_uuid")
+                if parent_uuid:
+                    mother_feat = self._load_feat(parent_uuid) or {}
+                    rel = mother_feat.get("source_path")
+            
+            if rel:
+                path_to_open = os.path.join(self.project_root, rel)
+
+        if not path_to_open and self.info_path.text() and self.info_path.text() != "-":
+            # 【關鍵修正】取得文字時，必須移除插入的「零寬度空白」，否則路徑會無效
+            text_path = self.info_path.text().replace("\u200b", "")
+            
+            if self.project_root and not os.path.isabs(text_path):
+                path_to_open = os.path.join(self.project_root, text_path)
             else:
-                return
+                path_to_open = text_path
 
-        uuid_ = meta.get("uuid")
-        if not uuid_ or not self.project_root:
-            return
+        if not path_to_open:
+            if hasattr(self.main, "list_files"):
+                items = self.main.list_files.selectedItems()
+                if items:
+                    meta = items[0].data(QtCore.Qt.UserRole) or {}
+                    rel = meta.get("rel")
+                    if rel:
+                        path_to_open = rel if os.path.isabs(rel) else os.path.join(self.project_root or "", rel)
 
-        feat = self._load_feat(uuid_) or {}
-        rel = feat.get("source_path")
-        if not rel:
-            parent_uuid = feat.get("parent_uuid")
-            if parent_uuid:
-                mother_feat = self._load_feat(parent_uuid) or {}
-                rel = mother_feat.get("source_path")
-
-        if not rel:
-            QtWidgets.QMessageBox.information(self, "找不到檔案", "此項目沒有來源檔案路徑。")
-            return
-
-        abs_path = os.path.join(self.project_root, rel)
-        if not os.path.exists(abs_path):
-            QtWidgets.QMessageBox.information(self, "檔案不存在", f"檔案路徑不存在：\n{abs_path}")
+        if not path_to_open or not os.path.exists(path_to_open):
+            QtWidgets.QMessageBox.information(self, "提示", f"無法定位檔案路徑。\n{path_to_open}")
             return
 
         try:
+            abs_path = os.path.normpath(path_to_open)
             if sys.platform.startswith("win"):
-                subprocess.Popen(["explorer", "/select,", os.path.normpath(abs_path)])
+                subprocess.Popen(["explorer", "/select,", abs_path])
             elif sys.platform == "darwin":
                 subprocess.Popen(["open", "-R", abs_path])
             else:
@@ -1046,44 +1199,51 @@ class GroupResultsWidget(QtWidgets.QWidget):
             QtWidgets.QMessageBox.warning(self, "開啟失敗", str(e))
 
     def _update_info_panel(self, uuid_: str | None, sub_id: int | None, group_id: str | None):
-        """將目前選擇的成員或群組寫到右側 infoPanel。"""
+        """更新右側資訊面板內容 (加入路徑斷行處理)"""
         if not self._info_labels:
             return
-        lab_uuid, lab_child, lab_size, lab_origin, lab_path, lab_dups = self._info_labels
-        def set_(w, v): w.setText(str(v) if w else "-")
+        lab_uuid, lab_child, lab_size, lab_origin, lab_path, lab_dups, lab_marked = self._info_labels
+        
+        # 輔助函式：設定文字前先處理斷行
+        def set_text_smart(widget, text):
+            if not widget: return
+            s = str(text) if text is not None else "-"
+            # 【關鍵魔法】在斜線後加入「零寬度空白 (\u200b)」，讓系統知道這裡可以換行
+            s_display = s.replace("/", "/\u200b").replace("\\", "\\\u200b")
+            widget.setText(s_display)
 
         if uuid_ is None and group_id:
             grp = next((g for g in (self.groups or []) if g.get("group_id") == group_id), None)
             mems = grp.get("members", []) if grp else []
-            set_(lab_uuid,  "-")
-            set_(lab_child, "-")
-            set_(lab_size,  "-")
-            set_(lab_origin, "群組")
-            set_(lab_path,   group_id)
-            set_(lab_dups,   len(mems) if mems else "-")
+            set_text_smart(lab_uuid,  "-")
+            set_text_smart(lab_child, "-")
+            set_text_smart(lab_size,  "-")
+            set_text_smart(lab_origin, "群組")
+            set_text_smart(lab_path,   group_id)
+            set_text_smart(lab_dups,   len(mems) if mems else "-")
             return
 
         if not uuid_:
             for w in (lab_uuid, lab_child, lab_size, lab_origin, lab_path, lab_dups):
-                set_(w, "-")
+                set_text_smart(w, "-")
             return
 
         feat = self._load_feat(uuid_) or {}
-        set_(lab_uuid, uuid_)
-        set_(lab_child, sub_id if sub_id is not None else "-")
+        set_text_smart(lab_uuid, uuid_)
+        set_text_smart(lab_child, sub_id if sub_id is not None else "-")
 
         if sub_id is None:
             dims = feat.get("dimensions") or {}
-            set_(lab_size, f'{dims.get("width","-")}×{dims.get("height","-")}')
+            set_text_smart(lab_size, f'{dims.get("width","-")}×{dims.get("height","-")}')
             rel = feat.get("source_path")
-            set_(lab_origin, "散圖")
+            set_text_smart(lab_origin, "散圖")
             if rel:
                 full_path = rel if os.path.isabs(rel) else os.path.join(self.project_root, rel)
-                set_(lab_path, full_path)
+                set_text_smart(lab_path, full_path)
             else:
-                set_(lab_path, "-")
+                set_text_smart(lab_path, "-")
         else:
-            set_(lab_origin, "組圖")
+            set_text_smart(lab_origin, "組圖")
             pu = uuid_  
             if pu:
                 bbox = None
@@ -1100,22 +1260,33 @@ class GroupResultsWidget(QtWidgets.QWidget):
                 if bbox and len(bbox) == 4:
                     w, h = bbox[2], bbox[3]
                 
-                set_(lab_size, f"{w}×{h}")
+                set_text_smart(lab_size, f"{w}×{h}")
                 rel = mother.get("source_path")
                 if rel:
                     full_path = rel if os.path.isabs(rel) else os.path.join(self.project_root, rel)
-                    set_(lab_path, full_path)
+                    set_text_smart(lab_path, full_path)
                 else:
-                    set_(lab_path, "-")
+                    set_text_smart(lab_path, "-")
             else:
-                set_(lab_size, "-")
-                set_(lab_path, "-")
+                set_text_smart(lab_size, "-")
+                set_text_smart(lab_path, "-")
 
         if group_id:
             grp = self.group_id_map.get(group_id)
-            set_(lab_dups, len(grp.get("members", [])) if grp else "-")
+            set_text_smart(lab_dups, len(grp.get("members", [])) if grp else "-")
         else:
-            set_(lab_dups, "-")
+            set_text_smart(lab_dups, "-")
+
+        is_marked = False
+        if hasattr(self.main, "index") and self.main.index:
+            try:
+                rel = self.main.index._uuid_to_rel.get(uuid_)
+                if rel:
+                    meta = self.main.index.data.get("image_map", {}).get(rel)
+                    if meta and meta.get("force_whole"):
+                        is_marked = True
+            except: pass
+        set_text_smart(lab_marked, "是" if is_marked else "否")
             
     def _members_of_group(self, group_id: str):
         for g in self.groups:

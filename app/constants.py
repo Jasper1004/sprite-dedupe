@@ -41,7 +41,7 @@ SINGLES_GROUP_KEY = "__SINGLES__"
 PHASH_HAMMING_MAX = getattr(__builtins__, "PHASH_HAMMING_MAX", 8)
 
 LIGHT_QSS = """
-* { font-family: "Segoe UI", "Microsoft JhengHei UI", Arial; font-size: 12px; }
+* { font-family: "Segoe UI", "Microsoft JhengHei UI", Arial; font-size: 12px; color: #1f2937; }
 QMainWindow { background: #f7f8fb; }
 QToolBar { background: #ffffff; border: none; padding: 6px; }
 QToolButton { padding: 6px 10px; border-radius: 8px; }

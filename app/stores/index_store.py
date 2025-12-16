@@ -75,3 +75,15 @@ class IndexStore:
             }
             self._uuid_to_rel[uid] = rel
             return uid
+
+    def set_force_whole(self, uuid_: str, val: bool):
+        """設定是否強制視為整張圖片 (不進行 Alpha CC 切割)"""
+        rel = self._uuid_to_rel.get(uuid_)
+        if rel and rel in self.data["image_map"]:
+            self.data["image_map"][rel]["force_whole"] = val
+
+    def mark_dirty(self, uuid_: str):
+        """強制標記為 Dirty，確保下次掃描時會重新計算特徵"""
+        rel = self._uuid_to_rel.get(uuid_)
+        if rel and rel in self.data["image_map"]:
+            self.data["image_map"][rel]["dirty_features"] = True
