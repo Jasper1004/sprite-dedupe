@@ -642,34 +642,6 @@ class GroupResultsWidget(QtWidgets.QWidget):
             self.pair_tree.setCurrentItem(self.pair_tree.topLevelItem(0))
             self._on_pair_tree_select()
 
-    # def _mother_pixmap(self, parent_uuid: str) -> QtGui.QPixmap | None:
-    #     if self.mother_pixmap_cache is None:
-    #         return None
-            
-    #     cached_pm = self.mother_pixmap_cache.get(parent_uuid)
-    #     if cached_pm is not None:
-    #         return cached_pm
-
-    #     mf = self._load_feat(parent_uuid)
-    #     if not mf: 
-    #         return None
-            
-    #     rel = mf.get("source_path")
-    #     if not rel or not self.project_root:
-    #         return None
-        
-    #     p = rel if os.path.isabs(rel) else os.path.join(self.project_root, rel)
-        
-    #     if not os.path.exists(p):
-    #         return None
-            
-    #     pm = QtGui.QPixmap(p)
-    #     if pm.isNull():
-    #         return None
-            
-    #     self.mother_pixmap_cache.put(parent_uuid, pm)
-    #     return pm
-
     def _mother_pixmap(self, parent_uuid: str) -> QtGui.QPixmap | None:
         """只從快取讀取，不執行硬碟 I/O，避免卡住 UI。"""
         if self.mother_pixmap_cache is None:
@@ -686,7 +658,6 @@ class GroupResultsWidget(QtWidgets.QWidget):
             return None
         return pm.copy(r)
     
-    # --- [修改後] 整段覆蓋 (包含新增的方法) ---
     def _on_bg_image_loaded(self, uuid_, img):
         """背景圖片讀取完成後的回調"""
         if img.isNull():
@@ -696,7 +667,6 @@ class GroupResultsWidget(QtWidgets.QWidget):
         if self.mother_pixmap_cache:
             self.mother_pixmap_cache.put(uuid_, pm)
 
-        # 只有當使用者目前還選著這張圖時，才更新畫面
         if self._loading_uuid == uuid_:
             if hasattr(self, "_last_selected_meta"):
                 self._update_views_from_meta(self._last_selected_meta)
@@ -739,7 +709,6 @@ class GroupResultsWidget(QtWidgets.QWidget):
         gid    = meta.get("group_id")
         self.current_uuid = uuid_
 
-        # 決定要讀取的母圖 UUID
         feat = self._load_feat(uuid_) or {}
         rel = feat.get("source_path")
         parent_uuid = feat.get("parent_uuid")
@@ -753,14 +722,11 @@ class GroupResultsWidget(QtWidgets.QWidget):
             mother_feat = self._load_feat(parent_uuid) or {}
             if not rel: rel = mother_feat.get("source_path")
 
-        # 1. 嘗試從快取讀取
         pm = self._mother_pixmap(target_load_uuid)
 
         if pm and not pm.isNull():
-            # 命中快取，直接顯示
             self._display_image_and_bboxes(pm, mother_feat, sub_id, meta)
         elif rel and self.project_root:
-            # 2. 沒命中快取，啟動背景載入
             abs_p = os.path.join(self.project_root, rel)
             if os.path.exists(abs_p):
                 worker = LoaderRunnable(abs_p, target_load_uuid, WorkerSignals())
@@ -770,80 +736,6 @@ class GroupResultsWidget(QtWidgets.QWidget):
         self._update_info_panel(uuid_, sub_id if parent_uuid else None, gid)
         if hasattr(self, "btn_open_folder"):
             self.btn_open_folder.setEnabled(bool(rel))
-
-    # def _update_views_from_meta(self, meta: dict | None):
-    #     """(私有) 根據 meta 字典更新右側視圖和資訊面板。"""
-    #     self._last_selected_meta = meta
-        
-    #     self.rightView.clear()
-
-    #     if not meta:
-    #         self._update_info_panel(None, None, None)
-    #         return
-
-    #     if meta.get("type") == "group":
-    #         gid = meta.get("group_id") or meta.get("parent_uuid")
-    #         self._update_info_panel(None, None, gid)
-    #         return
-        
-    #     uuid_  = meta.get("uuid")
-    #     sub_id = meta.get("sub_id")
-    #     gid    = meta.get("group_id")
-    #     self.current_uuid = uuid_
-
-    #     feat = self._load_feat(uuid_) or {}
-    #     rel = feat.get("source_path")
-    #     parent_uuid = feat.get("parent_uuid")
-
-    #     if sub_id is not None:
-    #         if not parent_uuid: 
-    #             parent_uuid = uuid_ 
-            
-    #         mother = self._load_feat(parent_uuid) or {}
-    #         if not rel: 
-    #             rel = mother.get("source_path")
-            
-    #         pm = self._mother_pixmap(parent_uuid)
-    #         if pm and not pm.isNull():
-    #             self.rightView.show_image(pm, fit=True)
-                
-    #             target_bbox_coords = meta.get("bbox")
-    #             if not target_bbox_coords:
-    #                 for si in (mother.get("sub_images") or []):
-    #                     if str(si.get("sub_id")) == str(sub_id):
-    #                         target_bbox_coords = si.get("bbox")
-    #                         break
-                
-    #             if target_bbox_coords:
-    #                 self.rightView.draw_bboxes([{
-    #                     "sub_id": str(sub_id), 
-    #                     "bbox": target_bbox_coords
-    #                 }])
-    #                 self.rightView.focus_bbox(str(sub_id))
-            
-    #         self._update_info_panel(uuid_, sub_id, gid)
-    #         if hasattr(self, "btn_open_folder"):
-    #             self.btn_open_folder.setEnabled(bool(rel))
-    #         return
-
-    #     pm = None
-    #     if self.mother_pixmap_cache:
-    #         pm = self.mother_pixmap_cache.get(uuid_)
-        
-    #     if pm and not pm.isNull():
-    #         self.rightView.show_image(pm, fit=True)
-    #     elif rel and self.project_root:
-    #         abs_p = os.path.join(self.project_root, rel)
-    #         if os.path.exists(abs_p):
-    #             pm = QtGui.QPixmap(abs_p)
-    #             if not pm.isNull():
-    #                 self.rightView.show_image(pm, fit=True)
-    #                 if self.mother_pixmap_cache:
-    #                     self.mother_pixmap_cache.put(uuid_, pm)
-        
-    #     self._update_info_panel(uuid_, None, gid)
-    #     if hasattr(self, "btn_open_folder"):
-    #         self.btn_open_folder.setEnabled(bool(rel))
 
     def _on_pair_tree_select(self):
         """群組樹／成員被點選時：右側顯示影像 + 更新資訊欄。"""
@@ -1036,7 +928,6 @@ class GroupResultsWidget(QtWidgets.QWidget):
         """右側資訊面板：使用 Grid Layout 並配合 SizePolicy 實現自動換行"""
         panel = QtWidgets.QWidget(self)
         
-        # 設定 Panel 自身為 Preferred，避免消失
         panel.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Preferred)
 
         outer = QtWidgets.QVBoxLayout(panel)
@@ -1047,7 +938,6 @@ class GroupResultsWidget(QtWidgets.QWidget):
         grid.setContentsMargins(0, 0, 0, 0)
         grid.setSpacing(10)
         
-        # 設定第 1 欄 (數值欄) 佔據多餘空間，這對自動換行很重要
         grid.setColumnStretch(1, 1)
 
         self.info_uuid   = QtWidgets.QLabel("-")
@@ -1065,16 +955,11 @@ class GroupResultsWidget(QtWidgets.QWidget):
         )
 
         for lbl in target_labels:
-            # 1. 啟用自動換行
             lbl.setWordWrap(True)
-            # 2. 內容靠左靠上
             lbl.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
-            
-            # 3. 【關鍵】Ignored + Minimum
-            # Ignored: 忽略文字原本的長度 (允許被壓縮，這樣才會觸發換行)
-            # Minimum: 換行後高度變高，自動撐開垂直空間
+
             lbl.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Minimum)
-            lbl.setMinimumWidth(1) # 騙過 Layout 允許縮到很小
+            lbl.setMinimumWidth(1)
             
             lbl.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
 
@@ -1134,7 +1019,6 @@ class GroupResultsWidget(QtWidgets.QWidget):
                 path_to_open = os.path.join(self.project_root, rel)
 
         if not path_to_open and self.info_path.text() and self.info_path.text() != "-":
-            # 【關鍵修正】取得文字時，必須移除插入的「零寬度空白」，否則路徑會無效
             text_path = self.info_path.text().replace("\u200b", "")
             
             if self.project_root and not os.path.isabs(text_path):
@@ -1204,11 +1088,9 @@ class GroupResultsWidget(QtWidgets.QWidget):
             return
         lab_uuid, lab_child, lab_size, lab_origin, lab_path, lab_dups, lab_marked = self._info_labels
         
-        # 輔助函式：設定文字前先處理斷行
         def set_text_smart(widget, text):
             if not widget: return
             s = str(text) if text is not None else "-"
-            # 【關鍵魔法】在斜線後加入「零寬度空白 (\u200b)」，讓系統知道這裡可以換行
             s_display = s.replace("/", "/\u200b").replace("\\", "\\\u200b")
             widget.setText(s_display)
 
