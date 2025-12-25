@@ -2950,7 +2950,7 @@ class MainWindow(QtWidgets.QMainWindow):
         msg = f"已將 {len(final_targets)} 張圖片【{action_text}】為『強制不切割』。"
         if count_ignored_singles > 0:
             msg += f"\n(已自動忽略 {count_ignored_singles} 張原本就是散圖的檔案)"
-        msg += "\n\n請點擊「清空」重新處理以套用變更。"
+        msg += "\n\n請點擊「重新執行」重新處理以套用變更。"
 
         self._update_mark_action_text()
 
