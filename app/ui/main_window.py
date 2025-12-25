@@ -245,6 +245,16 @@ class ScanWorker(QtCore.QObject):
                 self.finished.emit({"error": "No images to process."})
                 return
             
+            clean_item_ids = set()
+            if index_store and index_store.data:
+                for uid, abs_path in input_order:
+                    try:
+                        rel = index_store.rel(abs_path)
+                        meta = index_store.data.get("image_map", {}).get(rel)
+                        if meta and meta.get("uuid") == uid and not meta.get("dirty_features", True):
+                            clean_item_ids.add(uid)
+                    except: pass
+            
             self.logMessage.emit(f"步驟 1/4: 平行讀取 {total_input} 張圖片...")
             self.progressInit.emit(0, total_input)
             current_progress = 0
@@ -259,7 +269,8 @@ class ScanWorker(QtCore.QObject):
                 except Exception as e:
                     return f"[Error] {p}: {e}"
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
+            max_io_workers = min(os.cpu_count(), 4) 
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_io_workers) as executor:
                 results = list(executor.map(_load_task, input_order))
             
             for res in results:
@@ -302,6 +313,20 @@ class ScanWorker(QtCore.QObject):
                 if item.display_name.startswith(DO_NOT_SPLIT_PREFIXES):
                     return (item, None)
                 
+                if item.id in clean_item_ids:
+                    cached_feat = features_store.load(item.id)
+                    if cached_feat:
+                        if cached_feat.get("is_spritesheet"):
+                            subs = cached_feat.get("sub_images", [])
+                            cached_boxes = []
+                            for s in subs:
+                                b = s.get("bbox")
+                                if b and len(b) == 4:
+                                    cached_boxes.append(tuple(b))
+                            return (item, cached_boxes if cached_boxes else None)
+                        else:
+                            return (item, None)
+                
                 boxes_strict = alpha_cc_boxes(item.rgba, alpha_thr, min_area, min_size)
                 boxes_loose  = alpha_cc_boxes(item.rgba, alpha_thr, max(100, min_area // 2), max(4, min_size // 2))
                 is_sheet_strict = is_spritesheet(item.rgba, boxes_strict, spr_min_segs, spr_min_cover)
@@ -309,7 +334,7 @@ class ScanWorker(QtCore.QObject):
                 use_boxes = boxes_strict if is_sheet_strict else (boxes_loose if is_sheet_loose else None)
                 return (item, use_boxes)
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, os.cpu_count() - 2)) as executor:
                 alpha_results = list(executor.map(_alpha_task, local_items_raw))
 
             for item, use_boxes in alpha_results:
@@ -357,17 +382,6 @@ class ScanWorker(QtCore.QObject):
             self.logMessage.emit("步驟 3/4: 提取特徵...")
             self.progressInit.emit(0, len(local_pool))
             current_progress = 0
-            
-            clean_item_ids = set()
-            for it in local_pool:
-                try:
-                    check_uuid = it.parent_uuid if it.parent_uuid else it.id
-                    rel_path = index_store._uuid_to_rel.get(check_uuid)
-                    if rel_path:
-                        meta = index_store.data.get("image_map", {}).get(rel_path)
-                        if meta and meta.get("uuid") == check_uuid and not meta.get("dirty_features", True):
-                            clean_item_ids.add(it.id)
-                except: pass
 
             def _feat_task(item):
                 if self._abort: return None
@@ -393,7 +407,10 @@ class ScanWorker(QtCore.QObject):
                     mean_c = np.array([0., 0., 0.])
 
                 res_feat = {}
-                is_clean = item.id in clean_item_ids
+                
+                owner_uuid = item.parent_uuid if item.parent_uuid else item.id
+                is_clean = owner_uuid in clean_item_ids
+
                 used_cache = False
                 
                 if is_clean:
@@ -432,7 +449,8 @@ class ScanWorker(QtCore.QObject):
             phash_primary, phash_u, phash_v, phash_alpha, phash_edge = {}, {}, {}, {}, {}
             area_map, hgram_map, ar_map, mean_color_map = {}, {}, {}, {}
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
+            max_calc_workers = min(os.cpu_count(), 6)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_calc_workers) as executor:
                 feat_results = list(executor.map(_feat_task, local_pool))
 
             for uid, feats, small_img, exact_ar, mean_c in feat_results:
@@ -553,7 +571,9 @@ class ScanWorker(QtCore.QObject):
                 area_i = pool_area[i]
                 ar_i = pool_ars[i]
                 mc_i = pool_mc[i]
-                clean_i = id_i in clean_item_ids
+
+                uuid_i_base = id_i.split("#")[0] if "#" in id_i else id_i
+                clean_i = uuid_i_base in clean_item_ids
 
                 for j in range(i + 1, N):
                     if abs(ar_i - pool_ars[j]) > ASPECT_TOL: continue
@@ -565,7 +585,10 @@ class ScanWorker(QtCore.QObject):
                         continue
 
                     id_j = pool_ids[j]
-                    clean_j = id_j in clean_item_ids
+
+                    uuid_j_base = id_j.split("#")[0] if "#" in id_j else id_j
+                    clean_j = uuid_j_base in clean_item_ids
+
                     key = (id_i, id_j) if id_i < id_j else (id_j, id_i)
 
                     if clean_i and clean_j:
@@ -576,7 +599,7 @@ class ScanWorker(QtCore.QObject):
                                 local_pairs.append(PairHit(id_i, id_j, cached))
                                 local_seen_pair_keys.add(key)
                                 local_in_pair_ids.update([id_i, id_j])
-                            continue
+                        continue
 
                     raw_dist = _hamming64(hash_i, pool_phash_p[j])
                     
@@ -729,8 +752,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._last_selected_group_id = meta.get("group")
 
+        self._update_mark_action_text()
+
         if not uuid_:
             return
+        
+        self.group_view.select_member_by_uuid(uuid_, sub_id)
 
         feat = self.feature_json_cache.get(uuid_)
         if not feat:
@@ -1350,6 +1377,12 @@ class MainWindow(QtWidgets.QMainWindow):
         準備分群資料，並啟動「自動串流」載入機制。
         """
         self._list_mode = "grouped"
+
+        try:
+            self.list_files.itemSelectionChanged.disconnect()
+        except: pass
+        self.list_files.itemSelectionChanged.connect(self._update_mark_action_text)
+
         self.list_files.clear()
         self.list_files.setRowCount(0)
         self.list_files.setColumnCount(1)
@@ -1433,17 +1466,20 @@ class MainWindow(QtWidgets.QMainWindow):
                 row_index = current_rows + i
                 
                 row_widget = QtWidgets.QWidget()
-                row_widget.setAutoFillBackground(True)
-                palette = row_widget.palette()
-                palette.setColor(QtGui.QPalette.Window, colors[row_index % len(colors)])
-                row_widget.setPalette(palette)
+
+                bg_color = colors[row_index % len(colors)].name()
+                row_widget.setStyleSheet(f"background-color: {bg_color}; border-radius: 8px;")
+                row_widget.setObjectName("groupRow")
                 
                 row_layout = QtWidgets.QHBoxLayout(row_widget)
                 row_layout.setContentsMargins(15, 8, 15, 8)
                 row_layout.setSpacing(15)
 
                 rank = start_idx + i + 1
-                header_text = f"<b>{gname}</b><br><small>#{rank}</small> ({len(members)} 個)"
+                
+                header_text = f"<b>#{rank}</b> <small>({len(members)} 個)</small><br><span style='color:#606060'>{gname}</span>"
+                if self.dark_mode:
+                     header_text = f"<b>#{rank}</b> <small>({len(members)} 個)</small><br><span style='color:#a0a0a0'>{gname}</span>"
                 
                 header_label = QtWidgets.QLabel(header_text)
                 header_label.setFixedWidth(160)
@@ -1990,9 +2026,9 @@ class MainWindow(QtWidgets.QMainWindow):
             info_widget,
             (
                 self.group_view.info_uuid,
-                self.group_view.info_subid,
+                # self.group_view.info_subid,
                 self.group_view.info_size,
-                self.group_view.info_source,
+                # self.group_view.info_source,
                 self.group_view.info_path,
                 self.group_view.info_count,
                 self.group_view.info_marked,
@@ -2306,6 +2342,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.dark_mode = not self.dark_mode
         self._apply_theme()
 
+        if self._list_mode == "input":
+            self._refresh_file_list_input_mode()
+        elif self._list_mode == "grouped":
+            self.list_files.clearContents()
+            self.list_files.setRowCount(0)
+            self._grouped_loaded_count = 0
+            self._group_load_generation += 1
+            self._stream_next_batch_recursive(self._group_load_generation)
+
     def _image_exts(self) -> set[str]:
         return {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
 
@@ -2476,6 +2521,20 @@ class MainWindow(QtWidgets.QMainWindow):
             self.sb_text.setText(f"新增 {added} 張圖片")
 
     def on_clear(self):
+        if self.worker_thread and self.worker_thread.isRunning():
+            if self.worker:
+                self.worker._abort = True
+            self.worker_thread.quit()
+            self.worker_thread.wait(500)
+            if self.worker_thread.isRunning():
+                self.worker_thread.terminate()
+        
+        self.worker = None
+        self.worker_thread = None
+        
+        import gc
+        gc.collect()
+
         self.items_raw.clear()
         self.pool.clear()
         self.id2item.clear()
@@ -2536,12 +2595,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.act_add_dir.setEnabled(True)
         self.act_set_cache.setEnabled(True)
         self.act_clear.setEnabled(True)
+        self.act_mark_whole.setEnabled(True)
+
+        self.act_run.setText("開始處理")
+        self.act_run.setIcon(QtGui.QIcon.fromTheme("system-run"))
 
         self.act_add.setToolTip("新增圖片")
         self.act_add_dir.setToolTip("新增資料夾")
         self.act_run.setToolTip("開始處理")
         self.act_clear.setToolTip("清空")
         self.act_set_cache.setToolTip("設定產生的 JSON 與快取檔案存放位置 (預設為專案目錄下)")
+        self.act_mark_whole.setToolTip("將選取群組內的圖片標記為「強制不切割」")
 
     def on_params(self):
         dlg = QtWidgets.QDialog(self)
@@ -2577,6 +2641,37 @@ class MainWindow(QtWidgets.QMainWindow):
             self.sb_text.setText("已更新參數")
 
     def on_run(self):
+        has_dirty_files = False
+        if self.index and self.project_root:
+            for uid, abs_path in self._input_order:
+                try:
+                    rel = self.index.rel(abs_path)
+                    meta = self.index.data["image_map"].get(rel)
+                    
+                    if not meta or meta.get("dirty_features"):
+                        has_dirty_files = True
+                        break
+                except Exception:
+                    has_dirty_files = True
+                    break
+
+        is_rerun_mode = (self.act_run.text() == "重新執行")
+        
+        if is_rerun_mode and not has_dirty_files:
+            QtWidgets.QMessageBox.information(
+                self, 
+                "系統提示", 
+                "目前沒有發現新的變更 (沒有新圖片或標記狀態改變)。\n\n"
+                "系統已是最新狀態，無需重新執行。"
+            )
+            return
+        
+        if self._list_mode == "grouped":
+            self._refresh_file_list_input_mode()
+            if hasattr(self, "group_view"):
+                self.group_view.rightView.clear()
+                self.group_view._update_info_panel(None, None, None)
+
         self.sb_text.setText("正在初始化與準備資料...")
         self.status_led.setStyleSheet("background-color: #3b82f6; border-radius: 5px;")
         self.progress.setVisible(True)
@@ -2631,19 +2726,22 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.lb_pairs.setText(f"相似結果：{pair_count} 組")
                 self.sb_text.setText(f"已讀取快取結果 ({group_count} 群)")
 
-                self.act_run.setEnabled(False)
-                self.act_add.setEnabled(False)
-                self.act_add_dir.setEnabled(False)
-                self.act_set_cache.setEnabled(False)
+                self.act_run.setEnabled(True)
+                self.act_run.setText("重新執行")
+                self.act_run.setIcon(QtGui.QIcon.fromTheme("view-refresh"))
+                self.act_run.setToolTip("偵測到標記變更或新檔案時，點擊此處重新掃描")
+
+                self.act_add.setEnabled(True)
+                self.act_add_dir.setEnabled(True)
+                self.act_set_cache.setEnabled(True)
                 self.act_clear.setEnabled(True)
                 self.act_mark_whole.setEnabled(True) 
 
-                locked_tip = "功能已鎖定：請先按「清空」移除目前結果"
-                self.act_add.setToolTip(locked_tip)
-                self.act_add_dir.setToolTip(locked_tip)
-                self.act_run.setToolTip(locked_tip)
-                self.act_set_cache.setToolTip(locked_tip)
-                self.act_clear.setToolTip("清空")
+                self.act_mark_whole.setToolTip("將選取群組內的圖片標記為「強制不切割」")
+                self.act_clear.setToolTip("清空所有結果與輸入列表")
+                self.act_add.setToolTip("新增圖片")
+                self.act_add_dir.setToolTip("新增資料夾")
+                self.act_set_cache.setToolTip("設定產生的 JSON 與快取檔案存放位置")
                 
                 return
         
@@ -2653,6 +2751,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.act_add_dir.setEnabled(False)
             self.act_clear.setEnabled(False)
             self.act_set_cache.setEnabled(False)
+            self.act_mark_whole.setEnabled(False)
             
             processing_tip = "⚠️ 系統正在處理中，請稍候..."
             self.act_add.setToolTip(processing_tip)
@@ -2660,6 +2759,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.act_run.setToolTip(processing_tip)
             self.act_clear.setToolTip(processing_tip)
             self.act_set_cache.setToolTip(processing_tip)
+            self.act_mark_whole.setToolTip(processing_tip)
         except Exception:
             print("Warning: Cound not find act_run to disable.")
             
@@ -2698,14 +2798,63 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.worker_thread.start()
 
+    def _update_mark_action_text(self):
+        """根據目前選取的群組狀態，動態更新「標記為整圖」按鈕的文字 (標記/取消)"""
+        if self._list_mode != "grouped":
+            self.act_mark_whole.setText("標記為整圖")
+            self.act_mark_whole.setIcon(QtGui.QIcon.fromTheme("object-group"))
+            return
+
+        target_gids = set()
+        
+        rows = self.list_files.selectionModel().selectedRows()
+        if rows:
+            for idx in rows:
+                if idx.row() < len(self._grouped_data):
+                    gname, _ = self._grouped_data[idx.row()]
+                    target_gids.add(gname)
+        
+        if not target_gids and getattr(self, "_last_selected_group_id", None):
+            target_gids.add(self._last_selected_group_id)
+
+        if not target_gids:
+            self.act_mark_whole.setText("標記為整圖")
+            return
+
+        all_already_marked = True
+        has_valid_items = False
+        
+        if self.index and hasattr(self, "object_groups"):
+            for gid in target_gids:
+                members = self.object_groups.get(gid, [])
+                for m in members:
+                    uid = m.get("uuid")
+                    if not uid: continue
+                    real_uuid = uid.split("#")[0]
+                    
+                    rel = self.index._uuid_to_rel.get(real_uuid)
+                    if rel:
+                        has_valid_items = True
+                        meta = self.index.data["image_map"].get(rel)
+                        if not meta or not meta.get("force_whole"):
+                            all_already_marked = False
+                            break
+                if not all_already_marked: break
+        
+        if has_valid_items and all_already_marked:
+            self.act_mark_whole.setText("取消標記")
+            self.act_mark_whole.setIcon(QtGui.QIcon.fromTheme("edit-undo"))
+        else:
+            self.act_mark_whole.setText("標記為整圖")
+            self.act_mark_whole.setIcon(QtGui.QIcon.fromTheme("object-group"))
+
     def on_mark_whole(self):
-        """將選取群組的來源圖片標記為『強制不切割』(含自動偵測與重複檢查)"""
+        """將選取群組的來源圖片標記為『強制不切割』(混合模式：只標記 Spritesheet，忽略散圖)"""
         if self._list_mode != "grouped":
             QtWidgets.QMessageBox.information(self, "提示", "請先執行處理。")
             return
         
         target_group_ids = set()
-        
         if getattr(self, "_last_selected_group_id", None):
             target_group_ids.add(self._last_selected_group_id)
         
@@ -2723,7 +2872,6 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         touched_uuids = set()
-        
         if not hasattr(self, "object_groups") or not self.object_groups:
              QtWidgets.QMessageBox.warning(self, "錯誤", "找不到群組資料，請重新掃描。")
              return
@@ -2750,38 +2898,63 @@ class MainWindow(QtWidgets.QMainWindow):
              QtWidgets.QMessageBox.warning(self, "錯誤", "無法讀取索引 (IndexStore)。")
              return
 
-        all_already_marked = True
+        candidates_to_mark = []
+        candidates_to_unmark = []
+        
+        count_ignored_singles = 0
+
         for uid in touched_uuids:
             rel = self.index._uuid_to_rel.get(uid)
             if not rel: continue
             
             meta = self.index.data["image_map"].get(rel)
-            if not meta or not meta.get("force_whole"):
-                all_already_marked = False
-                break
-        
-        g_ids_str = ", ".join(sorted(list(target_group_ids)))
+            is_forced = meta and meta.get("force_whole")
+            
+            feat = self._load_feature_json(uid)
+            is_spritesheet = feat and feat.get("is_spritesheet", False)
 
-        if all_already_marked:
+            if is_forced:
+                # 已經標記過 -> 加入「取消標記」候選名單
+                candidates_to_unmark.append(uid)
+            elif is_spritesheet:
+                # 是 Spritesheet 且沒標記 -> 加入「標記」候選名單
+                candidates_to_mark.append(uid)
+            else:
+                # 原本就是散圖，且沒標記 -> 忽略
+                count_ignored_singles += 1
+
+        final_targets = []
+        new_val = True
+        action_text = ""
+
+        if candidates_to_mark:
+            final_targets = candidates_to_mark
+            new_val = True
+            action_text = "標記"
+        elif candidates_to_unmark:
+            final_targets = candidates_to_unmark
+            new_val = False
+            action_text = "取消標記"
+        else:
             QtWidgets.QMessageBox.information(
-                self, 
-                "已標記", 
-                f"群組 {g_ids_str} 中的檔案已經被標記為『整圖』，無需重複操作。"
+                self, "無需操作", "選取的群組中只包含「單張散圖」，無需執行標記。"
             )
             return
 
-        for uid in touched_uuids:
-            self.index.set_force_whole(uid, True)
+        for uid in final_targets:
+            self.index.set_force_whole(uid, new_val)
             self.index.mark_dirty(uid)
             
         self.index.save()
         
-        QtWidgets.QMessageBox.information(
-            self, 
-            "標記完成", 
-            f"已將群組 {g_ids_str} 中的來源圖片標記為『強制不切割』。\n\n"
-            "請點擊「清空」重新處理以套用變更。"
-        )
+        msg = f"已將 {len(final_targets)} 張圖片【{action_text}】為『強制不切割』。"
+        if count_ignored_singles > 0:
+            msg += f"\n(已自動忽略 {count_ignored_singles} 張原本就是散圖的檔案)"
+        msg += "\n\n請點擊「清空」重新處理以套用變更。"
+
+        self._update_mark_action_text()
+
+        QtWidgets.QMessageBox.information(self, "完成", msg)
     
     def _reset_status_to_ready(self):
         """輔助函式：將狀態重置為就緒"""
@@ -2791,23 +2964,31 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.pyqtSlot()
     def _on_worker_thread_finished(self):
-        """(私有) QThread 結束時，清理參照並重新啟用按鈕"""
+        """(私有) QThread 結束時，清理參照並更新按鈕狀態為『重新執行』模式"""
         self.worker_thread = None
         self.worker = None
         try:
-            self.act_run.setEnabled(False)
-            self.act_add.setEnabled(False)
-            self.act_add_dir.setEnabled(False)
-            self.act_set_cache.setEnabled(False)
-            self.act_clear.setEnabled(True)
+            self.act_run.setEnabled(True)
+            self.act_run.setText("重新執行")
+            self.act_run.setIcon(QtGui.QIcon.fromTheme("view-refresh"))
+            self.act_run.setToolTip("偵測到標記變更或新檔案時，點擊此處重新掃描")
 
-            locked_tip = "功能已鎖定：請先按「清空」移除目前結果"
-            self.act_add.setToolTip(locked_tip)
-            self.act_add_dir.setToolTip(locked_tip)
-            self.act_run.setToolTip(locked_tip)
-            self.act_set_cache.setToolTip(locked_tip)
+            self.act_add.setEnabled(True)
+            self.act_add_dir.setEnabled(True)
+            self.act_set_cache.setEnabled(True)
+            
+            self.act_clear.setEnabled(True)
+            self.act_mark_whole.setEnabled(True)
+    
+            self.act_mark_whole.setToolTip("將選取群組內的圖片標記為「強制不切割」")
+            self.act_clear.setToolTip("清空所有結果與輸入列表")
+
+            normal_tip = "開始處理"
+            self.act_add.setToolTip("新增圖片")
+            self.act_add_dir.setToolTip("新增資料夾")
+            self.act_set_cache.setToolTip("設定產生的 JSON 與快取檔案存放位置")
         except Exception:
-            print("Warning: Could not find act_run to enable.")
+            print("Warning: Could not update actions in _on_worker_thread_finished.")
 
     @QtCore.pyqtSlot(dict)
     def on_run_finished(self, results):
@@ -2860,7 +3041,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.progress.setValue(100)
         self.lb_pairs.setText(f"相似結果：{len(self.pairs)} 組")
-        self.sb_text.setText("配對完成，請於下方查看群組結果")
+        self.sb_text.setText("配對完成，請於上方查看群組結果")
         
         self._refresh_file_list_grouped_mode()
         # self.progress.setValue(100)
@@ -2953,6 +3134,12 @@ class MainWindow(QtWidgets.QMainWindow):
         urls = event.mimeData().urls()
         if not urls:
             return
+        
+        self.sb_text.setText("正在掃描拖入的檔案...")
+        self.status_led.setStyleSheet("background-color: #3b82f6; border-radius: 5px;")
+        self.progress.setVisible(True)
+        self.progress.setRange(0, 0)
+        QtWidgets.QApplication.processEvents()
 
         if not self.project_root:
             first_path = urls[0].toLocalFile()
@@ -2978,6 +3165,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         for url in urls:
             path = url.toLocalFile()
+
+            self.sb_text.setText(f"正在讀取: {os.path.basename(path)}...")
+            QtWidgets.QApplication.processEvents()
             
             if os.path.isdir(path):
                 for root_dir, _, filenames in os.walk(path):
@@ -3008,7 +3198,13 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.index:
             self.index.save()
 
+        self.sb_text.setText("正在建立預覽列表...")
+        QtWidgets.QApplication.processEvents()
+
         self._refresh_file_list_input_mode()
+
+        self.progress.setVisible(False)
+        self.status_led.setStyleSheet("background-color: #10b981; border-radius: 5px;")
         
         status_msg = ""
         if added:

@@ -941,16 +941,16 @@ class GroupResultsWidget(QtWidgets.QWidget):
         grid.setColumnStretch(1, 1)
 
         self.info_uuid   = QtWidgets.QLabel("-")
-        self.info_subid  = QtWidgets.QLabel("-")
+        # self.info_subid  = QtWidgets.QLabel("-")
         self.info_size   = QtWidgets.QLabel("-")
-        self.info_source = QtWidgets.QLabel("-")
+        # self.info_source = QtWidgets.QLabel("-")
         self.info_path   = QtWidgets.QLabel("-")
         self.info_count  = QtWidgets.QLabel("-")
         self.info_marked = QtWidgets.QLabel("-")
         
         target_labels = (
-            self.info_uuid, self.info_subid, self.info_size, 
-            self.info_source, self.info_path, self.info_count,
+            self.info_uuid, self.info_size, 
+            self.info_path, self.info_count,
             self.info_marked
         )
 
@@ -971,12 +971,12 @@ class GroupResultsWidget(QtWidgets.QWidget):
             grid.addWidget(value_widget, row, 1)
 
         add_row(0, "UUID：",    self.info_uuid)
-        add_row(1, "子圖ID：",  self.info_subid)
-        add_row(2, "尺寸：",    self.info_size)
-        add_row(3, "來源：",    self.info_source)
-        add_row(4, "路徑：",    self.info_path)
-        add_row(5, "同群數量：", self.info_count)
-        add_row(6, "標記整圖：", self.info_marked)
+        # add_row(1, "子圖ID：",  self.info_subid)
+        add_row(1, "尺寸：",    self.info_size)
+        # add_row(3, "來源：",    self.info_source)
+        add_row(2, "路徑：",    self.info_path)
+        add_row(3, "同群數量：", self.info_count)
+        add_row(4, "標記整圖：", self.info_marked)
         
         outer.addLayout(grid)
         outer.addStretch(1)
@@ -1086,7 +1086,7 @@ class GroupResultsWidget(QtWidgets.QWidget):
         """更新右側資訊面板內容 (加入路徑斷行處理)"""
         if not self._info_labels:
             return
-        lab_uuid, lab_child, lab_size, lab_origin, lab_path, lab_dups, lab_marked = self._info_labels
+        lab_uuid, lab_size, lab_path, lab_dups, lab_marked = self._info_labels
         
         def set_text_smart(widget, text):
             if not widget: return
@@ -1098,34 +1098,34 @@ class GroupResultsWidget(QtWidgets.QWidget):
             grp = next((g for g in (self.groups or []) if g.get("group_id") == group_id), None)
             mems = grp.get("members", []) if grp else []
             set_text_smart(lab_uuid,  "-")
-            set_text_smart(lab_child, "-")
+            # set_text_smart(lab_child, "-")
             set_text_smart(lab_size,  "-")
-            set_text_smart(lab_origin, "群組")
+            # set_text_smart(lab_origin, "群組")
             set_text_smart(lab_path,   group_id)
             set_text_smart(lab_dups,   len(mems) if mems else "-")
             return
 
         if not uuid_:
-            for w in (lab_uuid, lab_child, lab_size, lab_origin, lab_path, lab_dups):
+            for w in (lab_uuid, lab_size, lab_path, lab_dups):
                 set_text_smart(w, "-")
             return
 
         feat = self._load_feat(uuid_) or {}
         set_text_smart(lab_uuid, uuid_)
-        set_text_smart(lab_child, sub_id if sub_id is not None else "-")
+        # set_text_smart(lab_child, sub_id if sub_id is not None else "-")
 
         if sub_id is None:
             dims = feat.get("dimensions") or {}
             set_text_smart(lab_size, f'{dims.get("width","-")}×{dims.get("height","-")}')
             rel = feat.get("source_path")
-            set_text_smart(lab_origin, "散圖")
+            # set_text_smart(lab_origin, "散圖")
             if rel:
                 full_path = rel if os.path.isabs(rel) else os.path.join(self.project_root, rel)
                 set_text_smart(lab_path, full_path)
             else:
                 set_text_smart(lab_path, "-")
         else:
-            set_text_smart(lab_origin, "組圖")
+            # set_text_smart(lab_origin, "組圖")
             pu = uuid_  
             if pu:
                 bbox = None
