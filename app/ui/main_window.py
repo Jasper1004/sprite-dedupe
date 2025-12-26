@@ -958,7 +958,7 @@ class MainWindow(QtWidgets.QMainWindow):
              self.group_view.info_uuid.setText(uuid_[:8])
              self.group_view.info_size.setText(f"{w}x{h}" if w else "-")
              self.group_view.info_path.setText(rel)
-             self.group_view.info_source.setText("尚未處理")
+            #  self.group_view.info_source.setText("尚未處理")
 
              if hasattr(self.group_view, "btn_open_folder"):
                  self.group_view.btn_open_folder.setEnabled(True)
